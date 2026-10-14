@@ -19,6 +19,7 @@
         v-if="currentView === 'tables' && activeProfile"
         :profile="activeProfile"
         :tables="tables"
+        :table-states-map="tableStatesMap"
         :is-loading-tables="isLoadingTables"
         :is-syncing="isSyncing"
         @refresh-tables="fetchTables"
@@ -78,6 +79,10 @@ import {
   addHistoryEntry,
   clearSyncHistory,
 } from './services/historyStore.js';
+import {
+  getAllTableStates,
+  saveTableState,
+} from './services/syncStateStore.js';
 import { safeInvoke, safeListen } from './services/tauriHelper.js';
 
 // State
@@ -86,6 +91,7 @@ const activeProfileId = ref('');
 const currentView = ref('tables'); // 'tables' | 'new-profile' | 'edit-profile' | 'history'
 
 const tables = ref([]);
+const tableStatesMap = ref({});
 const isLoadingTables = ref(false);
 
 const isSyncing = ref(false);
@@ -105,10 +111,46 @@ const activeProfile = computed(() => {
   return profiles.value.find((p) => p.id === activeProfileId.value) || profiles.value[0];
 });
 
+function refreshLocalTableStates() {
+  if (!activeProfile.value) return;
+  tableStatesMap.value = getAllTableStates(activeProfile.value.id);
+}
+
+async function detectAndSyncLocalIds(tableList = null) {
+  if (!activeProfile.value?.local_db) return;
+  try {
+    const targetNames = tableList || tables.value.map((t) => t.name);
+    if (!targetNames || targetNames.length === 0) return;
+
+    const localInfos = await safeInvoke('get_all_tables_last_local_ids', {
+      config: activeProfile.value.local_db,
+      tables: targetNames,
+    });
+
+    if (Array.isArray(localInfos)) {
+      for (const info of localInfos) {
+        const existing = tableStatesMap.value[info.table_name] || {};
+        const updated = {
+          ...existing,
+          primaryKey: info.primary_key || existing.primaryKey || 'id',
+        };
+        if (info.max_id !== null && info.max_id !== undefined) {
+          updated.lastSyncedId = info.max_id;
+        }
+        saveTableState(activeProfile.value.id, info.table_name, updated);
+      }
+      refreshLocalTableStates();
+    }
+  } catch (err) {
+    console.warn('Gagal mendeteksi last local IDs:', err);
+  }
+}
+
 function handleSelectProfile(id) {
   activeProfileId.value = id;
   setActiveProfileId(id);
   currentView.value = 'tables';
+  refreshLocalTableStates();
   fetchTables();
 }
 
@@ -172,6 +214,7 @@ function handleClearHistory() {
 // Fetch remote tables via SSH
 async function fetchTables() {
   if (!activeProfile.value) return;
+  refreshLocalTableStates();
   isLoadingTables.value = true;
   try {
     const list = await safeInvoke('get_remote_tables', {
@@ -179,6 +222,8 @@ async function fetchTables() {
       remoteDbConfig: activeProfile.value.remote_db,
     });
     tables.value = Array.isArray(list) ? list : [];
+    // Also detect local primary keys and max IDs
+    detectAndSyncLocalIds();
   } catch (err) {
     console.error('Gagal mengambil daftar tabel remote:', err);
     // Add log or notification if needed
@@ -208,7 +253,7 @@ async function setupEventListeners() {
     });
     unlisteners.push(unProgress);
 
-    const unFinished = await safeListen('sync-finished', (event) => {
+    const unFinished = await safeListen('sync-finished', async (event) => {
       const result = event.payload;
       isSyncing.value = false;
 
@@ -227,6 +272,10 @@ async function setupEventListeners() {
           duration_text: durText,
         };
         historyList.value = addHistoryEntry(newEntry);
+
+        if (result.success && activeProfile.value) {
+          await detectAndSyncLocalIds();
+        }
       }
     });
     unlisteners.push(unFinished);
@@ -259,6 +308,8 @@ async function handleStartSync(syncOptions) {
         tables: syncOptions.tables,
         row_limit: syncOptions.row_limit,
         throttle_ms: 60,
+        sync_mode: syncOptions.sync_mode || 'incremental',
+        incremental_watermarks: syncOptions.incremental_watermarks || null,
       },
     });
 
@@ -276,6 +327,16 @@ async function handleStartSync(syncOptions) {
         duration_text: durText,
       };
       historyList.value = addHistoryEntry(newEntry);
+
+      if (res.success && activeProfile.value) {
+        const nowIso = new Date().toISOString();
+        for (const tbl of syncOptions.tables) {
+          saveTableState(activeProfile.value.id, tbl.name, {
+            lastSyncTime: nowIso,
+          });
+        }
+        await detectAndSyncLocalIds(syncOptions.tables.map((t) => t.name));
+      }
     }
   } catch (err) {
     console.error('Sinkronisasi error:', err);
@@ -301,6 +362,7 @@ onMounted(async () => {
   profiles.value = getStoredProfiles();
   activeProfileId.value = getActiveProfileId();
   historyList.value = getSyncHistory();
+  refreshLocalTableStates();
 
   await setupEventListeners();
   fetchTables();

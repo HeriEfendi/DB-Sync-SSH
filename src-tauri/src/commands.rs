@@ -34,6 +34,14 @@ pub async fn get_local_tables(config: LocalDbConfig) -> Result<Vec<String>, Stri
 }
 
 #[tauri::command]
+pub async fn get_all_tables_last_local_ids(
+    config: LocalDbConfig,
+    tables: Option<Vec<String>>,
+) -> Result<Vec<crate::models::TableLastIdInfo>, String> {
+    crate::local_db::get_all_tables_last_local_ids(&config, tables).await
+}
+
+#[tauri::command]
 pub async fn start_ssh_sync(
     app: tauri::AppHandle,
     ssh_config: SshConfig,

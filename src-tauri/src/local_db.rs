@@ -232,3 +232,99 @@ pub async fn get_local_tables(config: &LocalDbConfig) -> Result<Vec<String>, Str
     }
     Ok(tables)
 }
+
+pub async fn get_all_tables_last_local_ids(
+    config: &LocalDbConfig,
+    tables: Option<Vec<String>>,
+) -> Result<Vec<crate::models::TableLastIdInfo>, String> {
+    let conn_str = build_local_connection_string(config);
+    let pool = match MySqlPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(6))
+        .connect(&conn_str)
+        .await
+    {
+        Ok(p) => p,
+        Err(e) => return Err(format!("Koneksi ke MySQL lokal gagal: {}", e)),
+    };
+
+    // 1. Get primary keys for tables in the local database
+    let pk_query = "
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI'
+        ORDER BY ORDINAL_POSITION ASC
+    ";
+    let pk_rows = sqlx::query(pk_query).fetch_all(&pool).await.unwrap_or_default();
+
+    use std::collections::HashMap;
+    let mut pk_map: HashMap<String, String> = HashMap::new();
+    for r in pk_rows {
+        let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
+        let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
+        if !t_name.is_empty() && !c_name.is_empty() && !pk_map.contains_key(&t_name) {
+            pk_map.insert(t_name, c_name);
+        }
+    }
+
+    // 2. Target tables list
+    let target_tables = match tables {
+        Some(list) if !list.is_empty() => list,
+        _ => {
+            let mut all = Vec::new();
+            if let Ok(t_rows) = sqlx::query(
+                "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME ASC"
+            )
+            .fetch_all(&pool)
+            .await
+            {
+                for tr in t_rows {
+                    if let Ok(name) = tr.try_get::<String, _>(0) {
+                        all.push(name);
+                    }
+                }
+            }
+            all
+        }
+    };
+
+    let mut results = Vec::new();
+    for table in target_tables {
+        let pk_opt = pk_map.get(&table).cloned();
+        let mut max_id: Option<i64> = None;
+        let mut max_id_str: Option<String> = None;
+
+        if let Some(ref pk) = pk_opt {
+            let safe_t = sanitize_identifier(&table);
+            let safe_c = sanitize_identifier(pk);
+            if let (Ok(st), Ok(sc)) = (safe_t, safe_c) {
+                let q = format!("SELECT MAX({}) FROM {}", sc, st);
+                if let Ok(row) = sqlx::query(&q).fetch_one(&pool).await {
+                    if let Ok(val) = row.try_get::<i64, _>(0) {
+                        max_id = Some(val);
+                        max_id_str = Some(val.to_string());
+                    } else if let Ok(val) = row.try_get::<u64, _>(0) {
+                        max_id = Some(val as i64);
+                        max_id_str = Some(val.to_string());
+                    } else if let Ok(val) = row.try_get::<i32, _>(0) {
+                        max_id = Some(val as i64);
+                        max_id_str = Some(val.to_string());
+                    } else if let Ok(val) = row.try_get::<String, _>(0) {
+                        max_id = val.parse::<i64>().ok();
+                        max_id_str = Some(val);
+                    }
+                }
+            }
+        }
+
+        results.push(crate::models::TableLastIdInfo {
+            table_name: table,
+            primary_key: pk_opt,
+            max_id,
+            max_id_str,
+        });
+    }
+
+    pool.close().await;
+    Ok(results)
+}

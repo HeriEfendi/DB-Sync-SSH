@@ -15,6 +15,7 @@ pub fn run() {
             commands::test_local_connection,
             commands::get_remote_tables,
             commands::get_local_tables,
+            commands::get_all_tables_last_local_ids,
             commands::start_ssh_sync,
             commands::cancel_ssh_sync,
             commands::pick_private_key_file

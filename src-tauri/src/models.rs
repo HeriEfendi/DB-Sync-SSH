@@ -49,10 +49,28 @@ pub struct TableSyncItem {
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct WatermarkItem {
+    pub primary_key: String,
+    pub last_id: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TableLastIdInfo {
+    pub table_name: String,
+    pub primary_key: Option<String>,
+    pub max_id: Option<i64>,
+    pub max_id_str: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SyncOptions {
     pub tables: Vec<TableSyncItem>,
     pub row_limit: Option<usize>,
     pub throttle_ms: Option<u64>,
+    #[serde(default)]
+    pub sync_mode: Option<String>, // "incremental" | "fresh"
+    #[serde(default)]
+    pub incremental_watermarks: Option<std::collections::HashMap<String, WatermarkItem>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

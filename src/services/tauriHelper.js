@@ -57,6 +57,13 @@ export async function safeInvoke(cmd, args = {}) {
   if (cmd === 'get_local_tables') {
     return ['accounting_asset_categories', 'customers', 'products'];
   }
+  if (cmd === 'get_all_tables_last_local_ids') {
+    return [
+      { table_name: 'customers', primary_key: 'id', max_id: 4210, max_id_str: '4210' },
+      { table_name: 'orders', primary_key: 'id', max_id: 120500, max_id_str: '120500' },
+      { table_name: 'products', primary_key: 'id', max_id: 8420, max_id_str: '8420' },
+    ];
+  }
   if (cmd === 'pick_private_key_file') {
     return '/home/lenovo/.ssh/id_rsa';
   }

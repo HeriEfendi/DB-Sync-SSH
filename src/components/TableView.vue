@@ -68,32 +68,50 @@
       <div class="toolbar-bottom">
         <div class="toolbar-left">
           <div class="button-group-wrapper">
-            <span class="control-label">Set All:</span>
+            <span class="control-label">Mode:</span>
             <div class="pill-group">
               <button
                 class="pill-btn"
-                :class="{ active: globalMode === 'both' }"
-                @click="setGlobalMode('both')"
+                :class="{ active: syncMode === 'incremental' }"
+                title="Sync Server (New & Update): Hanya menyalin baris data baru setelah Last ID dan mengupdate baris yang ada (REPLACE INTO)"
+                @click="syncMode = 'incremental'"
               >
-                Data + Structure
+                Sync New &amp; Update
               </button>
               <button
-                class="pill-btn"
-                :class="{ active: globalMode === 'structure' }"
-                @click="setGlobalMode('structure')"
+                class="pill-btn warning-pill"
+                :class="{ active: syncMode === 'fresh' }"
+                title="Fresh Sync: Timpa bersih seluruh tabel lokal dari awal"
+                @click="syncMode = 'fresh'"
               >
-                Structure Only
+                Fresh Sync
               </button>
             </div>
           </div>
 
           <div class="row-limit-wrapper">
             <span class="control-label">Limit:</span>
+            <select
+              v-model="rowLimitPreset"
+              class="limit-select"
+              title="Batasan jumlah baris yang akan disalin per tabel"
+            >
+              <option :value="0">Unlimited (Semua)</option>
+              <option :value="1000">1.000 Row</option>
+              <option :value="10000">10.000 Row</option>
+              <option :value="50000">50.000 Row</option>
+              <option :value="100000">100.000 Row</option>
+              <option :value="500000">500.000 Row</option>
+              <option :value="1000000">1.000.000 Row</option>
+              <option value="custom">Custom...</option>
+            </select>
             <input
-              v-model="rowLimitInput"
-              type="text"
-              class="limit-input"
-              placeholder="Unlimited"
+              v-if="rowLimitPreset === 'custom'"
+              v-model.number="customRowLimit"
+              type="number"
+              min="1"
+              class="limit-custom-input"
+              placeholder="Jml baris"
             />
           </div>
         </div>
@@ -136,7 +154,8 @@
                 />
               </th>
               <th>Table Name</th>
-              <th class="col-total-rows">Total Rows</th>
+              <th class="col-last-id">Last ID</th>
+              <th class="col-last-sync">Last Sync</th>
               <th class="col-sync-mode">Sync Mode</th>
             </tr>
           </thead>
@@ -163,7 +182,27 @@
               >
                 {{ tbl.name }}
               </td>
-              <td class="col-total-rows">{{ formatNumber(tbl.total_rows) }}</td>
+              <td class="col-last-id">
+                <span
+                  v-if="tableStatesMap[tbl.name]?.lastSyncedId !== undefined && tableStatesMap[tbl.name]?.lastSyncedId !== null"
+                  class="last-id-pill"
+                  :title="'Primary key: ' + (tableStatesMap[tbl.name].primaryKey || 'id')"
+                >
+                  <span class="lbl">ID:</span>
+                  <strong>{{ formatLastId(tableStatesMap[tbl.name].lastSyncedId) }}</strong>
+                </span>
+                <span v-else class="text-dim-sync">-</span>
+              </td>
+              <td class="col-last-sync">
+                <span
+                  v-if="tableStatesMap[tbl.name]?.lastSyncTime"
+                  class="last-time-text"
+                  :title="formatFullDate(tableStatesMap[tbl.name].lastSyncTime)"
+                >
+                  {{ formatDisplayTime(tableStatesMap[tbl.name].lastSyncTime) }}
+                </span>
+                <span v-else class="text-dim-sync">Belum sync</span>
+              </td>
               <td class="col-sync-mode">
                 <div class="sync-mode-checks">
                   <label class="check-label disabled" title="Struktur tabel otomatis disinkronkan di background">
@@ -186,7 +225,7 @@
               </td>
             </tr>
             <tr v-if="filteredTables.length === 0">
-              <td colspan="4" class="empty-state-cell">
+              <td colspan="5" class="empty-state-cell">
                 <span v-if="isLoadingTables">Memuat daftar tabel remote...</span>
                 <span v-else>Tidak ada tabel yang cocok dengan pencarian atau koneksi belum dimuat.</span>
               </td>
@@ -215,6 +254,10 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  tableStatesMap: {
+    type: Object,
+    default: () => ({}),
+  },
   isLoadingTables: {
     type: Boolean,
     default: false,
@@ -230,8 +273,9 @@ const emit = defineEmits(['refresh-tables', 'start-sync', 'save-template', 'edit
 const searchInputRef = ref(null);
 const searchQuery = ref('');
 const selectedTemplateId = ref('all');
-const globalMode = ref('both'); // 'both' | 'structure'
-const rowLimitInput = ref('Unlimited');
+const syncMode = ref('incremental'); // 'incremental' | 'fresh'
+const rowLimitPreset = ref(0); // 0 = unlimited, numbers = preset, 'custom' = custom input
+const customRowLimit = ref(10000);
 
 // Per-table state: { selected: bool, sync_structure: bool, sync_data: bool }
 const tableStates = ref({});
@@ -379,8 +423,44 @@ function formatNumber(n) {
   return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
 }
 
+function formatLastId(id) {
+  if (id === null || id === undefined || id === '') return '-';
+  const num = Number(id);
+  if (!isNaN(num)) {
+    return formatNumber(num);
+  }
+  return String(id);
+}
+
+function formatDisplayTime(timeStr) {
+  if (!timeStr) return '';
+  try {
+    const d = new Date(timeStr);
+    if (isNaN(d.getTime())) return '';
+    const day = String(d.getDate()).padStart(2, '0');
+    const mon = String(d.getMonth() + 1).padStart(2, '0');
+    const hr = String(d.getHours()).padStart(2, '0');
+    const min = String(d.getMinutes()).padStart(2, '0');
+    return `${day}/${mon} ${hr}:${min}`;
+  } catch {
+    return '';
+  }
+}
+
+function formatFullDate(timeStr) {
+  if (!timeStr) return '';
+  try {
+    const d = new Date(timeStr);
+    return isNaN(d.getTime()) ? '' : d.toLocaleString('id-ID');
+  } catch {
+    return '';
+  }
+}
+
 function startSync() {
   const selectedItems = [];
+  const watermarks = {};
+
   for (const [tblName, s] of Object.entries(tableStates.value)) {
     if (s.selected) {
       selectedItems.push({
@@ -388,21 +468,33 @@ function startSync() {
         sync_structure: true,
         sync_data: Boolean(s.sync_data),
       });
+
+      // Pass watermark if table state has recorded primary key & lastSyncedId > 0
+      const st = props.tableStatesMap[tblName];
+      if (st && st.lastSyncedId !== undefined && st.lastSyncedId !== null && Number(st.lastSyncedId) > 0) {
+        watermarks[tblName] = {
+          primary_key: st.primaryKey || 'id',
+          last_id: Number(st.lastSyncedId) || 0,
+        };
+      }
     }
   }
 
   let rowLimit = null;
-  const rawLim = rowLimitInput.value.trim().toLowerCase();
-  if (rawLim && rawLim !== 'unlimited') {
-    const parsed = parseInt(rawLim, 10);
-    if (!isNaN(parsed) && parsed > 0) {
-      rowLimit = parsed;
+  if (rowLimitPreset.value === 'custom') {
+    const customNum = parseInt(customRowLimit.value, 10);
+    if (!isNaN(customNum) && customNum > 0) {
+      rowLimit = customNum;
     }
+  } else if (typeof rowLimitPreset.value === 'number' && rowLimitPreset.value > 0) {
+    rowLimit = rowLimitPreset.value;
   }
 
   emit('start-sync', {
     tables: selectedItems,
     row_limit: rowLimit,
+    sync_mode: syncMode.value,
+    incremental_watermarks: syncMode.value === 'incremental' ? watermarks : null,
   });
 }
 
