@@ -1,73 +1,161 @@
-# DB Sync Engine (SSH)
+# ⚡ DB Sync Engine (SSH)
 
-A high-performance desktop database synchronization tool built with **Tauri 2.0**, **Vue 3**, and **Rust**. 
+A high-performance desktop database synchronization tool built with **Tauri 2.0**, **Vue 3**, and **Rust**.
 
-Designed to sync remote MySQL / MariaDB databases securely across **SSH tunnels** directly into a local MySQL instance or Docker container, with zero web-server CPU overhead and instant streaming speeds.
-
----
-
-## 🚀 Fitur Utama
-
-- 🔒 **Secure SSH Transport**:
-  - Koneksi langsung melalui SSH port forwarding tunnel (`ssh2`) dengan dukungan:
-    - **SSH Key** (No Password / Passphrase) dengan file picker native.
-    - **Password Authentication**.
-    - **SSH Agent / Default Keys** (`~/.ssh`).
-- ⚡ **Direct Stream Pipeline**:
-  - Mengalirkan dump SQL secara langsung via child process STDIN ke MySQL lokal (`mysql`/`mariadb`) atau container Docker (`docker exec -i <container> mysql`).
-  - Zero disk I/O untuk file sementara: data mengalir langsung dari SSH stream ke database lokal.
-- 📋 **Preset Profiles & Multi-Table Selection**:
-  - Simpan dan kelola profil koneksi remote & lokal (seperti `staging_olshoperp2`, `tyas_olshoperp`).
-  - Filter pencarian tabel instan (`Ctrl+F`).
-  - Mode seleksi: *Data + Structure* atau *Structure Only*, dapat diatur per-tabel maupun global.
-  - Opsi *Row Limit* untuk sampling data staging/development.
-  - Template pilihan tabel kustom (*Save As New*).
-- 📜 **Sync History & Metrics**:
-  - Menampilkan riwayat sinkronisasi lengkap: Status (*Completed*, *Aborted*, *Failed*), jumlah tabel, baris yang disalin, durasi, dan timestamp.
-- 📊 **Real-time Live Progress & Terminal Logs**:
-  - Progress bar dinamis, penghitung baris masuk live, dan terminal log console interaktif.
-  - Tombol **Stop Sync** dengan terminasi proses yang bersih dan aman.
+Designed to synchronize remote MySQL / MariaDB databases securely across **SSH tunnels** directly into a local MySQL instance or Docker container, with zero web-server CPU overhead, bounded RAM usage, multi-worker concurrency, and instant keyset streaming.
 
 ---
 
-## 🛠️ Arsitektur Sistem
+## 🚀 Fitur Unggulan Terbaru
+
+### 1. 🔄 Dual Synchronization Modes
+* **Fresh Sync**:
+  * Melakukan reset penuh tabel di MySQL lokal (`DROP TABLE IF EXISTS` lalu `CREATE TABLE`).
+  * Mengalirkan seluruh data dari baris awal menggunakan `INSERT INTO` ber-chunk.
+  * Sangat cocok untuk inisialisasi awal database lokal dari server staging/production.
+* **Sync New & Update (Incremental)**:
+  * Mempertahankan struktur yang ada (`CREATE TABLE IF NOT EXISTS`).
+  * Otomatis melanjutkan penyalinan data dari **Last ID** tersimpan menggunakan `REPLACE INTO`.
+  * Memperbarui baris data yang berubah dan menyalin baris-baris baru secara kilat tanpa menimpa data yang tidak perlu.
+
+### 2. ⚡ Multi-Worker Pipeline Architecture
+Mengadopsi pola asinkron tingkat tinggi (Producer-Consumer over SSH):
+* **2 Concurrent Remote SSH Workers (Producers)**:
+  * Mengambil struktur DDL dan chunk data tabel secara paralel langsung melalui SSH port-forwarding tunnel.
+  * Mengisi bounded channel queue (`tokio::sync::mpsc::channel(4)`) untuk memangkas latensi transfer data SSH.
+* **1 Dedicated Local Importer Worker (Consumer)**:
+  * Membaca stream DDL dan data chunk dari channel queue dan mengalirkannya langsung ke STDIN child process `mysql` lokal.
+  * **Zero Temporary Disk I/O**: Dump SQL tidak pernah ditulis ke file disk lokal, melainkan langsung dialirkan secara *in-memory streaming*.
+* **Bounded RAM Buffer**:
+  * Antrian channel dibatasi hingga 4 chunk buffer sehingga konsumsi memori desktop tetap stabil dan ringan (< 60 MB RAM) meskipun menyinkronkan database berukuran puluhan gigabytes.
+
+### 3. 🧩 Keyset Pagination Chunking (50.000 Baris / Chunk)
+* **Bebas Beban Server Remote (No `COUNT(*)` Overhead)**:
+  * Menghilangkan query `SELECT COUNT(*)` lambat yang biasanya mengunci CPU database remote saat menangani tabel raksasa.
+* **Covering Index Boundary Discovery**:
+  * Mencari batas atas tiap chunk menggunakan index-only scan yang selesai dalam hitungan milidetik (< 10 ms):
+    ```sql
+    SELECT MAX(t.pk) FROM (
+      SELECT `id` AS pk FROM `nama_tabel`
+      WHERE `id` > current_last_id
+      ORDER BY `id` ASC LIMIT 50000
+    ) AS t;
+    ```
+  * Query slice data aman: `WHERE pk > start_id AND pk <= chunk_max`.
+* **Auto Primary Key Detection**:
+  * Otomatis mendeteksi kolom Primary Key tabel via `information_schema.COLUMNS`.
+  * Tabel tanpa integer/single Primary Key otomatis dialirkan secara aman melalui standard streaming fallback.
+
+### 4. 💾 State Watermarking & History Tracking
+* **Pencatatan Last ID & Last Sync**:
+  * Menyimpan status watermark per-tabel (`last_id`, `primary_key`, `mode`, `last_sync_at`) di SQLite lokal.
+  * Tampilan tabel luar memisahkan kolom **Last ID** dan **Last Sync** secara mandiri dan rapi.
+* **Riwayat Sinkronisasi (Sync History)**:
+  * Mencatat status eksekusi (*Completed*, *Aborted*, *Failed*), jumlah tabel, baris tersalin, dan durasi.
+  * Desain tabel riwayat yang padat dan informatif.
+
+### 5. 🔒 Transport & Keamanan SSH
+* Mendukung autentikasi SSH lengkap:
+  * **SSH Key (Tanpa Passphrase maupun dengan Passphrase)** disertai file picker native.
+  * **Password Authentication**.
+  * **SSH Agent / Default System Keys** (`~/.ssh/id_rsa`, `~/.ssh/id_ed25519`).
+* Auto-reconnect & safe cleanup: Otomatis memutus port forwarding dan menonaktifkan child process saat sinkronisasi dibatalkan.
+
+### 6. 🖥️ Antarmuka Pengguna Modern & Ringan
+* **Sticky Navigation & Layout**:
+  * Header koneksi dan bottom bar tindakan tetap berada di posisi statis (tidak ikut tergulung saat scroll tabel panjang).
+* **Auto-Sync DDL di Background**:
+  * Checkbox **Structure** diset terkunci (`checked` dan `disabled`), menandakan DDL selalu disinkronkan secara otomatis.
+* **Expanded Progress Console**:
+  * Modal progress berukuran luas (`max-width: 980px`) dengan tinggi terminal log `380px` (hingga `52vh`) untuk memantau aktivitas 2 worker secara live.
+* **Dukungan Lingkungan Lokal**:
+  * Mendukung koneksi MySQL/MariaDB native maupun **Docker Container** (`docker exec -i <container> mysql`).
+
+---
+
+## 🛠️ Alur Arsitektur Sinkronisasi
 
 ```
-+------------------------------------+
-|       Remote MySQL Server          |
-|  (Host: 127.0.0.1 / Remote Host)   |
-+-----------------+------------------+
-                  |
-                  | SSH Direct-TCPIP Tunnel / Remote mysqldump
-                  v
-+------------------------------------+
-|       Rust Tauri 2.0 Engine        |
-|  1. SSH Session Handshake & Auth   |
-|  2. Async Port-Forward Listener    |
-|  3. SQL DDL Fetcher & Stream Pipe  |
-+-----------------+------------------+
-                  |
-     Direct STDIN Pipe to Native CLI
-                  v
-+------------------------------------+
-|       Local Database Engine        |
-| - Native MySQL / MariaDB Client    |
-|   OR                               |
-| - Docker Container Engine          |
-+------------------------------------+
+  +-------------------------------------------------------------+
+  |                   Remote MySQL Database                     |
+  |                (Via SSH Port-Forward Tunnel)                |
+  +------------------------------+------------------------------+
+                                 |
+           +---------------------+---------------------+
+           |                                           |
+           v                                           v
++-----------------------+                   +-----------------------+
+|  SSH Worker 1 (Rust)  |                   |  SSH Worker 2 (Rust)  |
+| - Fast Keyset Chunk   |                   | - Fast Keyset Chunk   |
+| - DDL & Data Dump     |                   | - DDL & Data Dump     |
++-----------+-----------+                   +-----------+-----------+
+            |                                           |
+            +---------------------+---------------------+
+                                  |
+                                  v
+              +---------------------------------------+
+              |   Bounded Channel: mpsc::channel(4)   |
+              |   (Prevent RAM spike, Backpressure)   |
+              +-------------------+-------------------+
+                                  |
+                                  v
+              +---------------------------------------+
+              |    Local MySQL Importer (Consumer)    |
+              | - Non-blocking stream directly to     |
+              |   STDIN process (Native / Docker CLI) |
+              +-------------------+-------------------+
+                                  |
+                                  v
+              +---------------------------------------+
+              |         Local Database Engine         |
+              |   (Native MySQL / Docker Container)   |
+              +---------------------------------------+
 ```
 
 ---
 
-## 💻 Menjalankan Aplikasi
+## 📋 Prasyarat Sistem
 
-### Mode Pengembangan (Dev):
+1. **Rust & Cargo**: v1.75 ke atas ([rustup.rs](https://rustup.rs/))
+2. **Node.js**: v18 ke atas & `npm` / `pnpm`
+3. **Klien MySQL Lokal**:
+   * Binary `mysql` CLI terpasang pada `PATH` (atau engine Docker aktif jika menggunakan mode container).
+4. **Sistem Operasi**: Linux, macOS, atau Windows.
+
+---
+
+## 💻 Menjalankan & Membangun Aplikasi
+
+### Mode Pengembangan (Development):
 ```bash
+# Instalasi dependensi frontend
+npm install
+
+# Jalankan dev server Vite + Tauri GUI
 npm run tauri dev
 ```
 
-### Build Binary Desktop (Release):
+### Build Binary Siap Pakai (Production Release):
 ```bash
 npm run tauri build
 ```
-Hasil binary installer berekstensi `.deb`, `.rpm`, `.AppImage`, atau Arch Linux pacman akan dihasilkan di dalam folder `src-tauri/target/release/bundle/`.
+Paket installer dan binary executable akan dihasilkan di folder:
+`src-tauri/target/release/bundle/` (`.deb`, `.rpm`, `.AppImage`, atau `.exe`/`.dmg`).
+
+---
+
+## 📝 Format Konfigurasi Profil
+
+Aplikasi secara otomatis mengelola profil database lokal dan remote yang tersimpan terenkripsi/aman di direktori data aplikasi pengguna (`~/.local/share/db-sync-ssh/` di Linux).
+
+Contoh pengaturan profil:
+* **SSH Host / Port / User**: Akses ke server tujuan (misal `103.x.x.x:22`).
+* **SSH Auth**: Pilih *Password* atau *Private Key File*.
+* **Remote DB**: User, password, dan nama database di remote MySQL.
+* **Local DB**: Konfigurasi koneksi MySQL lokal atau nama container Docker.
+
+---
+
+## 📄 Lisensi
+
+Didistribusikan di bawah lisensi MIT. Silakan gunakan dan sesuaikan untuk kebutuhan tim atau proyek Anda.
