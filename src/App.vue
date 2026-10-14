@@ -1,0 +1,306 @@
+<template>
+  <div class="app-container">
+    <!-- Left Navigation Sidebar -->
+    <Sidebar
+      :profiles="profiles"
+      :active-profile-id="activeProfileId"
+      :current-view="currentView"
+      @select-profile="handleSelectProfile"
+      @create-profile="handleCreateProfile"
+      @open-history="currentView = 'history'"
+    />
+
+    <!-- Main Panel Content -->
+    <main class="main-panel">
+      <!-- 1. Table View (Screenshot 1) -->
+      <TableView
+        v-if="currentView === 'tables' && activeProfile"
+        :profile="activeProfile"
+        :tables="tables"
+        :is-loading-tables="isLoadingTables"
+        :is-syncing="isSyncing"
+        @refresh-tables="fetchTables"
+        @start-sync="handleStartSync"
+        @save-template="handleSaveTemplate"
+        @edit-profile="handleEditProfile"
+      />
+
+      <!-- 2. Profile Form View (Screenshot 2) -->
+      <ProfileForm
+        v-else-if="currentView === 'new-profile' || currentView === 'edit-profile'"
+        :initial-profile="currentView === 'edit-profile' ? activeProfile : null"
+        :is-editing="currentView === 'edit-profile'"
+        @save="handleSaveProfile"
+        @cancel="currentView = 'tables'"
+        @delete="handleDeleteProfile"
+      />
+
+      <!-- 3. History View (Screenshot 3) -->
+      <HistoryView
+        v-else-if="currentView === 'history'"
+        :history-list="historyList"
+        @clear-history="handleClearHistory"
+      />
+    </main>
+
+    <!-- Live Sync Modal with Real-time Logs -->
+    <SyncProgressModal
+      v-if="showSyncModal"
+      :profile-name="activeProfile?.name || ''"
+      :progress="syncProgress"
+      :logs="syncLogs"
+      :is-finished="!isSyncing"
+      @stop-sync="handleStopSync"
+      @minimize="showSyncModal = false"
+      @close="showSyncModal = false"
+    />
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import Sidebar from './components/Sidebar.vue';
+import TableView from './components/TableView.vue';
+import ProfileForm from './components/ProfileForm.vue';
+import HistoryView from './components/HistoryView.vue';
+import SyncProgressModal from './components/SyncProgressModal.vue';
+
+import {
+  getStoredProfiles,
+  saveProfiles,
+  getActiveProfileId,
+  setActiveProfileId,
+} from './services/profileStore.js';
+import {
+  getSyncHistory,
+  addHistoryEntry,
+  clearSyncHistory,
+} from './services/historyStore.js';
+import { safeInvoke, safeListen } from './services/tauriHelper.js';
+
+// State
+const profiles = ref([]);
+const activeProfileId = ref('');
+const currentView = ref('tables'); // 'tables' | 'new-profile' | 'edit-profile' | 'history'
+
+const tables = ref([]);
+const isLoadingTables = ref(false);
+
+const isSyncing = ref(false);
+const showSyncModal = ref(false);
+const syncLogs = ref([]);
+const syncProgress = ref({
+  current_table_index: 0,
+  total_tables: 0,
+  current_table_name: '',
+  rows_synced_current_table: 0,
+  total_synced_all_tables: 0,
+  status: 'idle',
+});
+const historyList = ref([]);
+
+const activeProfile = computed(() => {
+  return profiles.value.find((p) => p.id === activeProfileId.value) || profiles.value[0];
+});
+
+function handleSelectProfile(id) {
+  activeProfileId.value = id;
+  setActiveProfileId(id);
+  currentView.value = 'tables';
+  fetchTables();
+}
+
+function handleCreateProfile() {
+  currentView.value = 'new-profile';
+}
+
+function handleEditProfile() {
+  currentView.value = 'edit-profile';
+}
+
+function handleSaveProfile(savedProfile) {
+  const idx = profiles.value.findIndex((p) => p.id === savedProfile.id);
+  if (idx !== -1) {
+    profiles.value[idx] = savedProfile;
+  } else {
+    profiles.value.push(savedProfile);
+  }
+  activeProfileId.value = savedProfile.id;
+  setActiveProfileId(savedProfile.id);
+  saveProfiles(profiles.value);
+  currentView.value = 'tables';
+  fetchTables();
+}
+
+function handleDeleteProfile(id) {
+  profiles.value = profiles.value.filter((p) => p.id !== id);
+  if (profiles.value.length === 0) {
+    handleCreateProfile();
+  } else {
+    activeProfileId.value = profiles.value[0].id;
+    setActiveProfileId(activeProfileId.value);
+    currentView.value = 'tables';
+    fetchTables();
+  }
+  saveProfiles(profiles.value);
+}
+
+function handleSaveTemplate({ name, tableNames }) {
+  if (!activeProfile.value) return;
+  if (!activeProfile.value.templates) {
+    activeProfile.value.templates = [];
+  }
+  const newTpl = {
+    id: `tpl-${Date.now()}`,
+    name,
+    tableNames,
+  };
+  activeProfile.value.templates.push(newTpl);
+  saveProfiles(profiles.value);
+}
+
+function handleClearHistory() {
+  historyList.value = clearSyncHistory();
+}
+
+// Fetch remote tables via SSH
+async function fetchTables() {
+  if (!activeProfile.value) return;
+  isLoadingTables.value = true;
+  try {
+    const list = await safeInvoke('get_remote_tables', {
+      sshConfig: activeProfile.value.ssh,
+      remoteDbConfig: activeProfile.value.remote_db,
+    });
+    tables.value = Array.isArray(list) ? list : [];
+  } catch (err) {
+    console.error('Gagal mengambil daftar tabel remote:', err);
+    // Add log or notification if needed
+  } finally {
+    isLoadingTables.value = false;
+  }
+}
+
+// Listeners cleanup array
+let unlisteners = [];
+
+async function setupEventListeners() {
+  try {
+    const unLog = await safeListen('sync-log', (event) => {
+      const payload = event.payload;
+      if (payload) {
+        syncLogs.value.push(payload);
+      }
+    });
+    unlisteners.push(unLog);
+
+    const unProgress = await safeListen('sync-progress', (event) => {
+      const payload = event.payload;
+      if (payload) {
+        syncProgress.value = payload;
+      }
+    });
+    unlisteners.push(unProgress);
+
+    const unFinished = await safeListen('sync-finished', (event) => {
+      const result = event.payload;
+      isSyncing.value = false;
+
+      // Add to history
+      if (result) {
+        const durationSec = Math.round((result.duration_ms || 0) / 1000);
+        const mins = Math.floor(durationSec / 60);
+        const secs = durationSec % 60;
+        const durText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+        const newEntry = {
+          profile_name: activeProfile.value?.name || 'database',
+          status: result.success ? 'Completed' : 'Aborted',
+          tables_count: result.total_tables || 0,
+          rows_copied: result.total_rows_synced || 0,
+          duration_text: durText,
+        };
+        historyList.value = addHistoryEntry(newEntry);
+      }
+    });
+    unlisteners.push(unFinished);
+  } catch (e) {
+    console.warn('Failed to register listeners:', e);
+  }
+}
+
+async function handleStartSync(syncOptions) {
+  if (isSyncing.value || !activeProfile.value) return;
+
+  isSyncing.value = true;
+  showSyncModal.value = true;
+  syncLogs.value = [];
+  syncProgress.value = {
+    current_table_index: 0,
+    total_tables: syncOptions.tables.length,
+    current_table_name: syncOptions.tables[0]?.name || '',
+    rows_synced_current_table: 0,
+    total_synced_all_tables: 0,
+    status: 'starting',
+  };
+
+  try {
+    const res = await safeInvoke('start_ssh_sync', {
+      sshConfig: activeProfile.value.ssh,
+      remoteDbConfig: activeProfile.value.remote_db,
+      localDbConfig: activeProfile.value.local_db,
+      syncOptions: {
+        tables: syncOptions.tables,
+        row_limit: syncOptions.row_limit,
+        throttle_ms: 60,
+      },
+    });
+
+    if (res) {
+      const durationSec = Math.round((res.duration_ms || 0) / 1000);
+      const mins = Math.floor(durationSec / 60);
+      const secs = durationSec % 60;
+      const durText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+
+      const newEntry = {
+        profile_name: activeProfile.value?.name || 'database',
+        status: res.success ? 'Completed' : 'Aborted',
+        tables_count: res.total_tables || 0,
+        rows_copied: res.total_rows_synced || 0,
+        duration_text: durText,
+      };
+      historyList.value = addHistoryEntry(newEntry);
+    }
+  } catch (err) {
+    console.error('Sinkronisasi error:', err);
+    syncLogs.value.push({
+      type: 'error',
+      message: `Error: ${err}`,
+      timestamp: new Date().toLocaleTimeString(),
+    });
+  } finally {
+    isSyncing.value = false;
+  }
+}
+
+async function handleStopSync() {
+  try {
+    await safeInvoke('cancel_ssh_sync');
+  } catch (err) {
+    console.warn('Gagal membatalkan sinkronisasi:', err);
+  }
+}
+
+onMounted(async () => {
+  profiles.value = getStoredProfiles();
+  activeProfileId.value = getActiveProfileId();
+  historyList.value = getSyncHistory();
+
+  await setupEventListeners();
+  fetchTables();
+});
+
+onBeforeUnmount(() => {
+  unlisteners.forEach((fn) => typeof fn === 'function' && fn());
+});
+</script>

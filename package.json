@@ -1,0 +1,22 @@
+{
+  "name": "db-sync-ssh",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
+    "tauri": "tauri"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.12.3",
+    "lucide-vue-next": "^0.475.0",
+    "vue": "^3.5.42"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.12.2",
+    "@vitejs/plugin-vue": "^6.0.8",
+    "vite": "^8.3.0"
+  }
+}
