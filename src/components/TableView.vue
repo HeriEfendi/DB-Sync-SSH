@@ -5,170 +5,199 @@
       <div class="header-title-group">
         <h1 class="main-title">{{ profile.name }}</h1>
         <div class="main-subtitle">
-          <Database :size="15" />
+          <Database :size="13" />
           <span>mysql • {{ profile.ssh?.host || 'remote' }} → {{ profile.local_db?.host || 'localhost' }}:{{ profile.local_db?.port || 3306 }}</span>
         </div>
       </div>
       <div class="header-actions">
         <button
-          class="btn-secondary"
+          class="btn-icon"
           title="Edit Connection Profile"
           @click="$emit('edit-profile')"
         >
-          <Settings :size="16" />
+          <Settings :size="15" />
         </button>
       </div>
     </header>
 
-    <!-- Filter & Template Controls -->
-    <div class="filter-row">
-      <div class="search-input-wrapper">
-        <Search class="search-icon" />
-        <input
-          ref="searchInputRef"
-          v-model="searchQuery"
-          type="text"
-          class="search-input"
-          placeholder="Search tables... (Ctrl+F)"
-        />
-      </div>
+    <!-- Toolbar: Desktop Card -->
+    <div class="table-toolbar">
+      <div class="toolbar-top">
+        <div class="toolbar-left">
+          <div class="search-input-wrapper">
+            <Search class="search-icon" :size="13" />
+            <input
+              ref="searchInputRef"
+              v-model="searchQuery"
+              type="text"
+              class="search-input"
+              placeholder="Search tables... (Ctrl+F)"
+            />
+          </div>
 
-      <div class="selection-actions">
-        <button class="link-btn" @click="handleSelectAll">Select All</button>
-        <span style="color: #cbd5e1">|</span>
-        <button class="link-btn" @click="handleClearAll">Clear</button>
-      </div>
-
-      <div class="template-group">
-        <span class="template-label">Template:</span>
-        <select
-          v-model="selectedTemplateId"
-          class="template-select"
-          @change="applyTemplate"
-        >
-          <option value="all">All Tables</option>
-          <option
-            v-for="tpl in profile.templates || []"
-            :key="tpl.id"
-            :value="tpl.id"
-          >
-            {{ tpl.name }}
-          </option>
-        </select>
-        <button class="btn-secondary" @click="handleSaveTemplate">Save As New</button>
-      </div>
-    </div>
-
-    <!-- Action Bar -->
-    <div class="action-row">
-      <div class="action-left">
-        <div class="button-group-wrapper">
-          <span class="group-label">Set All To:</span>
-          <div class="pill-group">
-            <button
-              class="pill-btn"
-              :class="{ active: globalMode === 'both' }"
-              @click="setGlobalMode('both')"
-            >
-              Data + Structure
-            </button>
-            <button
-              class="pill-btn"
-              :class="{ active: globalMode === 'structure' }"
-              @click="setGlobalMode('structure')"
-            >
-              Structure Only
-            </button>
+          <div class="selection-actions">
+            <button class="btn-chip" title="Select all filtered tables" @click="handleSelectAll">Select All</button>
+            <button class="btn-chip" title="Clear all selection" @click="handleClearAll">Clear</button>
           </div>
         </div>
 
-        <div class="row-limit-wrapper">
-          <span class="group-label">Row Limit:</span>
-          <input
-            v-model="rowLimitInput"
-            type="text"
-            class="limit-input"
-            placeholder="Unlimited"
-          />
+        <div class="toolbar-right">
+          <div class="template-group">
+            <span class="control-label">Template:</span>
+            <select
+              v-model="selectedTemplateId"
+              class="template-select"
+              @change="applyTemplate"
+            >
+              <option value="all">All Tables</option>
+              <option
+                v-for="tpl in profile.templates || []"
+                :key="tpl.id"
+                :value="tpl.id"
+              >
+                {{ tpl.name }}
+              </option>
+            </select>
+            <button class="btn-secondary" @click="handleSaveTemplate">Save As New</button>
+          </div>
         </div>
       </div>
 
-      <div class="action-right">
-        <button
-          class="btn-refresh"
-          :disabled="isLoadingTables"
-          @click="$emit('refresh-tables')"
-        >
-          <RotateCw :size="15" :class="{ 'spin-anim': isLoadingTables }" />
-          <span>Refresh</span>
-        </button>
+      <div class="toolbar-divider"></div>
 
-        <button
-          class="btn-primary"
-          :disabled="selectedCount === 0 || isSyncing"
-          @click="startSync"
-        >
-          <Play :size="16" />
-          <span>Start Sync ({{ selectedCount }})</span>
-        </button>
+      <div class="toolbar-bottom">
+        <div class="toolbar-left">
+          <div class="button-group-wrapper">
+            <span class="control-label">Set All:</span>
+            <div class="pill-group">
+              <button
+                class="pill-btn"
+                :class="{ active: globalMode === 'both' }"
+                @click="setGlobalMode('both')"
+              >
+                Data + Structure
+              </button>
+              <button
+                class="pill-btn"
+                :class="{ active: globalMode === 'structure' }"
+                @click="setGlobalMode('structure')"
+              >
+                Structure Only
+              </button>
+            </div>
+          </div>
+
+          <div class="row-limit-wrapper">
+            <span class="control-label">Limit:</span>
+            <input
+              v-model="rowLimitInput"
+              type="text"
+              class="limit-input"
+              placeholder="Unlimited"
+            />
+          </div>
+        </div>
+
+        <div class="toolbar-right">
+          <button
+            class="btn-refresh"
+            :disabled="isLoadingTables"
+            @click="$emit('refresh-tables')"
+          >
+            <RotateCw :size="13" :class="{ 'spin-anim': isLoadingTables }" />
+            <span>Refresh</span>
+          </button>
+
+          <button
+            class="btn-primary"
+            :disabled="selectedCount === 0 || isSyncing"
+            @click="startSync"
+          >
+            <Play :size="13" />
+            <span>Start Sync ({{ selectedCount }})</span>
+          </button>
+        </div>
       </div>
     </div>
 
-    <!-- Table List -->
+    <!-- Table Card with Fixed Header and Scrollable Body -->
     <div class="table-card">
-      <table class="data-table">
-        <thead>
-          <tr>
-            <th class="col-select">Select</th>
-            <th>Table Name</th>
-            <th class="col-total-rows">Total Rows</th>
-            <th class="col-sync-mode">Sync Mode</th>
-          </tr>
-        </thead>
-        <tbody>
-          <tr
-            v-for="tbl in filteredTables"
-            :key="tbl.name"
-            :class="{ 'row-deselected': !tableStates[tbl.name]?.selected }"
-          >
-            <td class="col-select">
-              <input
-                type="checkbox"
-                :checked="tableStates[tbl.name]?.selected"
-                @change="toggleTableSelect(tbl.name, $event.target.checked)"
-              />
-            </td>
-            <td class="col-table-name">{{ tbl.name }}</td>
-            <td class="col-total-rows">{{ formatNumber(tbl.total_rows) }}</td>
-            <td class="col-sync-mode">
-              <div class="sync-mode-checks">
-                <label class="check-label">
-                  <input
-                    type="checkbox"
-                    :checked="tableStates[tbl.name]?.sync_structure"
-                    @change="toggleMode(tbl.name, 'sync_structure', $event.target.checked)"
-                  />
-                  <span>Structure</span>
-                </label>
-                <label class="check-label">
-                  <input
-                    type="checkbox"
-                    :checked="tableStates[tbl.name]?.sync_data"
-                    @change="toggleMode(tbl.name, 'sync_data', $event.target.checked)"
-                  />
-                  <span>Data</span>
-                </label>
-              </div>
-            </td>
-          </tr>
-          <tr v-if="filteredTables.length === 0">
-            <td colspan="4" style="text-align: center; padding: 2rem; color: #64748b;">
-              <span v-if="isLoadingTables">Memuat daftar tabel remote...</span>
-              <span v-else>Tidak ada tabel yang cocok dengan pencarian atau koneksi belum dimuat.</span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
+      <div class="table-scroll-container">
+        <table class="data-table">
+          <thead>
+            <tr>
+              <th class="col-select">
+                <input
+                  type="checkbox"
+                  :checked="isAllSelected"
+                  :indeterminate.prop="isIndeterminate"
+                  title="Toggle Select All"
+                  @change="toggleSelectAllFiltered($event.target.checked)"
+                />
+              </th>
+              <th>Table Name</th>
+              <th class="col-total-rows">Total Rows</th>
+              <th class="col-sync-mode">Sync Mode</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr
+              v-for="tbl in filteredTables"
+              :key="tbl.name"
+              :class="{
+                'row-selected': tableStates[tbl.name]?.selected,
+                'row-deselected': !tableStates[tbl.name]?.selected
+              }"
+            >
+              <td class="col-select">
+                <input
+                  type="checkbox"
+                  :checked="tableStates[tbl.name]?.selected"
+                  @change="toggleTableSelect(tbl.name, $event.target.checked)"
+                />
+              </td>
+              <td
+                class="col-table-name"
+                title="Click to toggle selection"
+                @click="toggleTableSelect(tbl.name, !tableStates[tbl.name]?.selected)"
+              >
+                {{ tbl.name }}
+              </td>
+              <td class="col-total-rows">{{ formatNumber(tbl.total_rows) }}</td>
+              <td class="col-sync-mode">
+                <div class="sync-mode-checks">
+                  <label class="check-label disabled" title="Struktur tabel otomatis disinkronkan di background">
+                    <input
+                      type="checkbox"
+                      :checked="true"
+                      disabled
+                    />
+                    <span>Structure</span>
+                  </label>
+                  <label class="check-label" title="Centang untuk menyalin isi data tabel">
+                    <input
+                      type="checkbox"
+                      :checked="tableStates[tbl.name]?.sync_data"
+                      @change="toggleMode(tbl.name, 'sync_data', $event.target.checked)"
+                    />
+                    <span>Data</span>
+                  </label>
+                </div>
+              </td>
+            </tr>
+            <tr v-if="filteredTables.length === 0">
+              <td colspan="4" class="empty-state-cell">
+                <span v-if="isLoadingTables">Memuat daftar tabel remote...</span>
+                <span v-else>Tidak ada tabel yang cocok dengan pencarian atau koneksi belum dimuat.</span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="table-footer-status">
+        <span>Menampilkan <strong>{{ filteredTables.length }}</strong> tabel</span>
+        <span>Terpilih: <strong style="color: var(--primary-blue)">{{ selectedCount }}</strong> dari {{ tables.length }} tabel</span>
+      </div>
     </div>
   </div>
 </template>
@@ -238,6 +267,26 @@ const filteredTables = computed(() => {
 const selectedCount = computed(() => {
   return Object.values(tableStates.value).filter((s) => s.selected).length;
 });
+
+const isAllSelected = computed(() => {
+  if (filteredTables.value.length === 0) return false;
+  return filteredTables.value.every((tbl) => tableStates.value[tbl.name]?.selected);
+});
+
+const isIndeterminate = computed(() => {
+  const selectedInFiltered = filteredTables.value.filter(
+    (tbl) => tableStates.value[tbl.name]?.selected
+  ).length;
+  return selectedInFiltered > 0 && selectedInFiltered < filteredTables.value.length;
+});
+
+function toggleSelectAllFiltered(checked) {
+  filteredTables.value.forEach((tbl) => {
+    if (tableStates.value[tbl.name]) {
+      tableStates.value[tbl.name].selected = checked;
+    }
+  });
+}
 
 function handleSelectAll() {
   const isFiltered = searchQuery.value.trim() !== '';
@@ -336,7 +385,7 @@ function startSync() {
     if (s.selected) {
       selectedItems.push({
         name: tblName,
-        sync_structure: Boolean(s.sync_structure),
+        sync_structure: true,
         sync_data: Boolean(s.sync_data),
       });
     }

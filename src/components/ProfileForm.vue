@@ -2,17 +2,19 @@
   <div class="form-card-container">
     <header class="form-header">
       <button class="back-btn" title="Kembali" @click="$emit('cancel')">
-        <ArrowLeft :size="20" />
+        <ArrowLeft :size="14" />
       </button>
       <h1 class="main-title">
         {{ isEditing ? 'Edit Connection Profile' : 'New Connection Profile' }}
       </h1>
     </header>
 
-    <!-- 1. General Section -->
+    <!-- Scrollable Form Body -->
+    <div class="form-scrollable-body">
+      <!-- 1. General Section -->
     <div class="form-section">
       <div class="section-title-row">
-        <Database :size="18" />
+        <Database :size="14" />
         <span>General</span>
       </div>
       <div class="form-grid">
@@ -38,7 +40,7 @@
     <!-- 2. SSH Configuration -->
     <div class="form-section">
       <div class="section-title-row">
-        <Shield :size="18" />
+        <Shield :size="14" />
         <span>SSH Configuration</span>
       </div>
       <div class="form-grid">
@@ -134,7 +136,7 @@
     <!-- 3. Remote Database Configuration -->
     <div class="form-section">
       <div class="section-title-row">
-        <Server :size="18" />
+        <Server :size="14" />
         <span>Remote Database Configuration</span>
       </div>
       <div class="form-grid">
@@ -193,7 +195,7 @@
     <!-- 4. Local Database Configuration -->
     <div class="form-section">
       <div class="section-title-row">
-        <HardDrive :size="18" />
+        <HardDrive :size="14" />
         <span>Local Database Configuration</span>
       </div>
       <div class="form-grid">
@@ -274,9 +276,10 @@
     >
       {{ testStatusMessage }}
     </div>
+    </div> <!-- end .form-scrollable-body -->
 
-    <!-- Action Footer -->
-    <div class="form-actions-footer">
+    <!-- Static Action Footer on Bottom -->
+    <footer class="form-actions-footer">
       <div class="footer-left">
         <button
           type="button"
@@ -284,7 +287,7 @@
           :disabled="isTesting"
           @click="runTestSshAndRemote"
         >
-          <CheckCircle2 :size="16" />
+          <CheckCircle2 :size="14" />
           <span>Test SSH & Remote DB</span>
         </button>
         <button
@@ -293,7 +296,7 @@
           :disabled="isTesting"
           @click="runTestLocal"
         >
-          <CheckCircle2 :size="16" />
+          <CheckCircle2 :size="14" />
           <span>Test Local DB</span>
         </button>
       </div>
@@ -305,7 +308,8 @@
           class="btn-danger"
           @click="handleDelete"
         >
-          Delete
+          <Trash2 :size="13" />
+          <span>Delete</span>
         </button>
         <button type="button" class="btn-secondary" @click="$emit('cancel')">
           Cancel
@@ -314,13 +318,47 @@
           Save Profile
         </button>
       </div>
+    </footer>
+
+    <!-- Confirm Delete Modal -->
+    <div
+      v-if="showDeleteConfirm"
+      class="confirm-modal-overlay"
+      @click.self="showDeleteConfirm = false"
+    >
+      <div class="confirm-modal-box">
+        <div class="confirm-modal-header">
+          <AlertTriangle :size="20" class="confirm-warning-icon" />
+          <h3 class="confirm-title">Hapus Koneksi?</h3>
+        </div>
+        <p class="confirm-message">
+          Apakah Anda yakin ingin menghapus koneksi <strong>"{{ form.name }}"</strong>? Tindakan ini tidak dapat dibatalkan.
+        </p>
+        <div class="confirm-actions">
+          <button type="button" class="btn-secondary" @click="showDeleteConfirm = false">
+            Batal
+          </button>
+          <button type="button" class="btn-danger-solid" @click="confirmDelete">
+            Hapus
+          </button>
+        </div>
+      </div>
     </div>
   </div>
 </template>
 
 <script setup>
-import { ref } from 'vue';
-import { ArrowLeft, Database, Shield, Server, HardDrive, CheckCircle2 } from 'lucide-vue-next';
+import { ref, onMounted, onBeforeUnmount } from 'vue';
+import {
+  ArrowLeft,
+  Database,
+  Shield,
+  Server,
+  HardDrive,
+  CheckCircle2,
+  Trash2,
+  AlertTriangle,
+} from 'lucide-vue-next';
 import { safeInvoke } from '../services/tauriHelper.js';
 
 const props = defineProps({
@@ -446,11 +484,30 @@ function handleSave() {
   emit('save', JSON.parse(JSON.stringify(form.value)));
 }
 
+const showDeleteConfirm = ref(false);
+
 function handleDelete() {
-  if (confirm(`Yakin ingin menghapus profile '${form.value.name}'?`)) {
-    emit('delete', form.value.id);
+  showDeleteConfirm.value = true;
+}
+
+function confirmDelete() {
+  showDeleteConfirm.value = false;
+  emit('delete', form.value.id);
+}
+
+function onKeyDown(e) {
+  if (e.key === 'Escape' && showDeleteConfirm.value) {
+    showDeleteConfirm.value = false;
   }
 }
+
+onMounted(() => {
+  window.addEventListener('keydown', onKeyDown);
+});
+
+onBeforeUnmount(() => {
+  window.removeEventListener('keydown', onKeyDown);
+});
 </script>
 
 <style scoped>

@@ -7,6 +7,8 @@
       :current-view="currentView"
       @select-profile="handleSelectProfile"
       @create-profile="handleCreateProfile"
+      @edit-profile="handleEditProfile"
+      @delete-profile="handleDeleteProfile"
       @open-history="currentView = 'history'"
     />
 
@@ -114,7 +116,11 @@ function handleCreateProfile() {
   currentView.value = 'new-profile';
 }
 
-function handleEditProfile() {
+function handleEditProfile(id) {
+  if (id) {
+    activeProfileId.value = id;
+    setActiveProfileId(id);
+  }
   currentView.value = 'edit-profile';
 }
 
