@@ -185,6 +185,8 @@ function handleSaveProfile(savedProfile) {
 function handleDeleteProfile(id) {
   profiles.value = profiles.value.filter((p) => p.id !== id);
   if (profiles.value.length === 0) {
+    activeProfileId.value = '';
+    setActiveProfileId('');
     handleCreateProfile();
   } else {
     activeProfileId.value = profiles.value[0].id;
@@ -394,7 +396,14 @@ async function handleStopSync() {
 
 onMounted(async () => {
   profiles.value = getStoredProfiles();
-  activeProfileId.value = getActiveProfileId();
+  const storedActiveProfileId = getActiveProfileId();
+  activeProfileId.value = profiles.value.some((profile) => profile.id === storedActiveProfileId)
+    ? storedActiveProfileId
+    : profiles.value[0]?.id || '';
+  if (activeProfileId.value !== storedActiveProfileId) {
+    setActiveProfileId(activeProfileId.value);
+  }
+  currentView.value = profiles.value.length === 0 ? 'new-profile' : 'tables';
   historyList.value = getSyncHistory();
   refreshLocalTableStates();
 
