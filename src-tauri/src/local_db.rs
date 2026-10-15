@@ -30,17 +30,130 @@ pub fn sanitize_identifier(ident: &str) -> Result<String, String> {
     Ok(format!("`{}`", escaped))
 }
 
+fn detect_docker_mysql_cli(container: &str) -> Result<&'static str, String> {
+    let mysql_output = crate::process_utils::new_std_command("docker")
+        .arg("exec")
+        .arg(container)
+        .arg("mysql")
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            format!(
+                "Gagal menjalankan Docker untuk kontainer '{}': {}. Pastikan Docker terpasang dan aktif.",
+                container, e
+            )
+        })?;
+    if mysql_output.status.success() {
+        return Ok("mysql");
+    }
+
+    let mariadb_output = crate::process_utils::new_std_command("docker")
+        .arg("exec")
+        .arg(container)
+        .arg("mariadb")
+        .arg("--version")
+        .output()
+        .map_err(|e| {
+            format!(
+                "Kontainer '{}' tidak menjalankan MySQL CLI dan pemeriksaan MariaDB gagal: {}",
+                container, e
+            )
+        })?;
+    if mariadb_output.status.success() {
+        return Ok("mariadb");
+    }
+
+    let output_text = |output: &std::process::Output| {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit status {}", output.status)
+        }
+    };
+
+    Err(format!(
+        "Kontainer '{}' tidak memiliki MySQL atau MariaDB CLI.\n• mysql: {}\n• mariadb: {}",
+        container,
+        output_text(&mysql_output),
+        output_text(&mariadb_output)
+    ))
+}
+
+fn validate_docker_container(config: &LocalDbConfig) -> Result<&str, String> {
+    let container = config.docker_container.trim();
+    if container.is_empty() {
+        return Err("Opsi Docker aktif, tetapi nama container belum diisi.".to_string());
+    }
+    Ok(container)
+}
+
+fn build_create_database_sql(database: &str) -> Result<String, String> {
+    let safe_database = sanitize_identifier(database)?;
+    Ok(format!(
+        "CREATE DATABASE IF NOT EXISTS {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;",
+        safe_database
+    ))
+}
+
+async fn create_database_in_docker(
+    config: &LocalDbConfig,
+    container: &str,
+    create_sql: &str,
+) -> Result<(), String> {
+    let cli = detect_docker_mysql_cli(container)?;
+    let mut command = new_tokio_command("docker");
+    command
+        .arg("exec")
+        .arg(container)
+        .arg(cli)
+        .arg("--skip-ssl")
+        .arg("--connect-timeout=60")
+        .arg("-u")
+        .arg(&config.username);
+
+    if !config.password.is_empty() {
+        command.arg(format!("-p{}", config.password));
+    }
+    command.arg("-e").arg(create_sql);
+
+    let output = command.output().await.map_err(|e| {
+        format!(
+            "Gagal membuat database lokal via Docker container '{}': {}",
+            container, e
+        )
+    })?;
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        format!("exit status {}", output.status)
+    };
+    Err(format!(
+        "Gagal membuat database lokal via Docker container '{}': {}",
+        container, detail
+    ))
+}
+
 pub async fn test_local_connection(config: &LocalDbConfig) -> Result<String, String> {
     if config.use_docker {
-        let container = config.docker_container.trim();
-        if container.is_empty() {
-            return Err("Nama Docker container belum diisi".to_string());
-        }
+        let container = validate_docker_container(config)?;
+        let cli = detect_docker_mysql_cli(container)?;
 
         let mut cmd = new_tokio_command("docker");
         cmd.arg("exec")
             .arg(container)
-            .arg("mysql")
+            .arg(cli)
             .arg("-u")
             .arg(&config.username);
 
@@ -66,7 +179,7 @@ pub async fn test_local_connection(config: &LocalDbConfig) -> Result<String, Str
             .nth(1)
             .unwrap_or("Docker MySQL Connected")
             .trim();
-        return Ok(format!("Docker [{}]: {}", container, version));
+        return Ok(format!("Docker [{}] ({}): {}", container, cli, version));
     }
 
     let conn_str = build_local_connection_string(config);
@@ -86,8 +199,11 @@ pub async fn test_local_connection(config: &LocalDbConfig) -> Result<String, Str
 }
 
 pub async fn ensure_local_database_exists(config: &LocalDbConfig) -> Result<(), String> {
-    if config.database.trim().is_empty() {
-        return Err("Nama database lokal tidak boleh kosong".to_string());
+    let create_sql = build_create_database_sql(&config.database)?;
+
+    if config.use_docker {
+        let container = validate_docker_container(config)?;
+        return create_database_in_docker(config, container, &create_sql).await;
     }
 
     let host = if config.host.trim().is_empty() {
@@ -112,13 +228,7 @@ pub async fn ensure_local_database_exists(config: &LocalDbConfig) -> Result<(), 
         .await
         .map_err(|e| format!("Gagal terhubung ke MySQL server lokal: {}", e))?;
 
-    let safe_db = sanitize_identifier(&config.database)?;
-    let query = format!(
-        "CREATE DATABASE IF NOT EXISTS {} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
-        safe_db
-    );
-
-    sqlx::query(&query)
+    sqlx::query(&create_sql)
         .execute(&pool)
         .await
         .map_err(|e| format!("Gagal membuat database lokal '{}': {}", config.database, e))?;
@@ -137,15 +247,20 @@ pub fn spawn_mysql_child(
     ),
     String,
 > {
-    let use_docker = local_config.use_docker && !local_config.docker_container.trim().is_empty();
-    let container_name = local_config.docker_container.trim();
+    let use_docker = local_config.use_docker;
+    let container_name = if use_docker {
+        validate_docker_container(local_config)?
+    } else {
+        local_config.docker_container.trim()
+    };
 
     let mut cmd = if use_docker {
+        let cli = detect_docker_mysql_cli(container_name)?;
         let mut c = new_tokio_command("docker");
         c.arg("exec")
             .arg("-i")
             .arg(container_name)
-            .arg("mysql")
+            .arg(cli)
             .arg("--skip-ssl")
             .arg("--local-infile=1")
             .arg("--quick")
@@ -341,4 +456,49 @@ pub async fn get_all_tables_last_local_ids(
 
     pool.close().await;
     Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_create_database_sql, validate_docker_container};
+    use crate::models::LocalDbConfig;
+
+    fn local_config(docker_container: &str) -> LocalDbConfig {
+        LocalDbConfig {
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            username: "root".to_string(),
+            password: String::new(),
+            database: "sync_db".to_string(),
+            use_docker: true,
+            docker_container: docker_container.to_string(),
+        }
+    }
+
+    #[test]
+    fn create_database_sql_escapes_database_identifiers() {
+        assert_eq!(
+            build_create_database_sql("db`name").unwrap(),
+            "CREATE DATABASE IF NOT EXISTS `db``name` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;"
+        );
+    }
+
+    #[test]
+    fn create_database_sql_rejects_empty_database_name() {
+        assert!(build_create_database_sql("  ").is_err());
+    }
+
+    #[test]
+    fn docker_mode_requires_container_name() {
+        let error = validate_docker_container(&local_config("  ")).unwrap_err();
+        assert!(error.contains("nama container"));
+    }
+
+    #[test]
+    fn docker_mode_trims_container_name() {
+        assert_eq!(
+            validate_docker_container(&local_config("  local-mysql  ")).unwrap(),
+            "local-mysql"
+        );
+    }
 }
