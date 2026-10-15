@@ -15,8 +15,8 @@ Designed to synchronize remote MySQL / MariaDB databases securely across **SSH t
   * Sangat cocok untuk inisialisasi awal database lokal dari server staging/production.
 * **Sync New & Update (Incremental)**:
   * Mempertahankan struktur yang ada (`CREATE TABLE IF NOT EXISTS`).
-  * Otomatis melanjutkan penyalinan data dari **Last ID** tersimpan menggunakan `REPLACE INTO`.
-  * Memperbarui baris data yang berubah dan menyalin baris-baris baru secara kilat tanpa menimpa data yang tidak perlu.
+  * Menggunakan watermark **Last ID** dan waktu server remote. Tabel dengan kolom `updated_at` menyalin baris baru serta perubahan yang dibuat sejak sinkronisasi berhasil sebelumnya.
+  * Tabel tanpa `updated_at` (atau watermark waktu yang valid) memakai full upsert dengan `REPLACE INTO` agar perubahan pada baris lama tidak terlewat; ini lebih akurat tetapi dapat mentransfer lebih banyak data.
 
 ### 2. ⚡ Multi-Worker Pipeline Architecture
 Mengadopsi pola asinkron tingkat tinggi (Producer-Consumer over SSH):

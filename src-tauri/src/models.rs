@@ -52,6 +52,8 @@ pub struct TableSyncItem {
 pub struct WatermarkItem {
     pub primary_key: String,
     pub last_id: i64,
+    #[serde(default)]
+    pub last_sync_time: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -99,6 +101,7 @@ pub struct SyncResult {
     pub total_tables: usize,
     pub total_rows_synced: usize,
     pub duration_ms: u64,
+    pub sync_timestamp: Option<String>,
     pub error: Option<String>,
     pub failures: Vec<SyncFailure>,
 }

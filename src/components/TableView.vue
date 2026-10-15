@@ -435,7 +435,7 @@ function formatLastId(id) {
 function formatDisplayTime(timeStr) {
   if (!timeStr) return '';
   try {
-    const d = new Date(timeStr);
+    const d = new Date(timeStr.includes(' ') ? timeStr.replace(' ', 'T').slice(0, 23) : timeStr);
     if (isNaN(d.getTime())) return '';
     const day = String(d.getDate()).padStart(2, '0');
     const mon = String(d.getMonth() + 1).padStart(2, '0');
@@ -450,7 +450,7 @@ function formatDisplayTime(timeStr) {
 function formatFullDate(timeStr) {
   if (!timeStr) return '';
   try {
-    const d = new Date(timeStr);
+    const d = new Date(timeStr.includes(' ') ? timeStr.replace(' ', 'T').slice(0, 23) : timeStr);
     return isNaN(d.getTime()) ? '' : d.toLocaleString('id-ID');
   } catch {
     return '';
@@ -469,12 +469,13 @@ function startSync() {
         sync_data: Boolean(s.sync_data),
       });
 
-      // Pass watermark if table state has recorded primary key & lastSyncedId > 0
+      // Pass both row ID and the remote timestamp from the previous successful sync.
       const st = props.tableStatesMap[tblName];
       if (st && st.lastSyncedId !== undefined && st.lastSyncedId !== null && Number(st.lastSyncedId) > 0) {
         watermarks[tblName] = {
           primary_key: st.primaryKey || 'id',
           last_id: Number(st.lastSyncedId) || 0,
+          last_sync_time: st.lastSyncTime || null,
         };
       }
     }

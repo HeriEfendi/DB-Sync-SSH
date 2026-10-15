@@ -6,7 +6,7 @@ use crate::models::{
 use crate::ssh_client::{establish_ssh_session, start_ssh_tunnel};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::Row;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -138,6 +138,36 @@ fn resolve_sync_status(
     } else {
         "success"
     }
+}
+
+fn normalize_mysql_timestamp(value: &str) -> Option<String> {
+    chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
+        .ok()
+        .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+}
+
+fn build_chunk_where_clause(
+    safe_pk: &str,
+    current_last_id: i64,
+    chunk_max: i64,
+    update_filter: Option<(i64, &str, &str)>,
+) -> String {
+    let range_condition = if current_last_id == 0 {
+        format!("{} <= {}", safe_pk, chunk_max)
+    } else {
+        format!(
+            "{} > {} AND {} <= {}",
+            safe_pk, current_last_id, safe_pk, chunk_max
+        )
+    };
+    let condition = match update_filter {
+        Some((watermark_id, updated_at_col, timestamp)) => format!(
+            "({} > {} OR {} >= '{}') AND {}",
+            safe_pk, watermark_id, updated_at_col, timestamp, range_condition
+        ),
+        None => range_condition,
+    };
+    format!("--where={}", condition)
 }
 
 fn check_importer_running<R: tauri::Runtime>(
@@ -533,7 +563,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         }
     };
 
-    // Pre-query primary key columns of remote tables in 1 quick batch query
+    // Pre-query primary keys and update timestamp columns in batch queries.
     let pk_query = "
         SELECT TABLE_NAME, COLUMN_NAME 
         FROM information_schema.COLUMNS 
@@ -553,6 +583,27 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         }
     }
     let pk_map = Arc::new(pk_map);
+
+    let updated_at_query = "
+        SELECT TABLE_NAME
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND LOWER(COLUMN_NAME) = 'updated_at'
+    ";
+    let updated_at_rows = sqlx::query(updated_at_query)
+        .fetch_all(&*remote_pool)
+        .await
+        .map_err(|e| format!("Gagal membaca metadata kolom updated_at remote: {}", e))?;
+    let tables_with_updated_at: HashSet<String> = updated_at_rows
+        .iter()
+        .filter_map(|row| row.try_get::<String, _>("TABLE_NAME").ok())
+        .collect();
+    let tables_with_updated_at = Arc::new(tables_with_updated_at);
+
+    let sync_timestamp: String =
+        sqlx::query_scalar("SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f')")
+            .fetch_one(&*remote_pool)
+            .await
+            .map_err(|e| format!("Gagal membaca waktu server MySQL remote: {}", e))?;
 
     let total_tables = sync_options.tables.len();
     let sync_mode = sync_options.sync_mode.as_deref().unwrap_or("incremental");
@@ -909,6 +960,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let queue_c = tables_queue.clone();
         let pool_c = remote_pool.clone();
         let pk_map_c = pk_map.clone();
+        let updated_at_tables_c = tables_with_updated_at.clone();
         let watermarks_c = incremental_watermarks.clone();
         let remote_cfg_c = remote_db_cfg.clone();
         let app_c = app.clone();
@@ -1044,7 +1096,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         None
                     };
 
-                    let start_id = match watermark {
+                    let watermark_id = match watermark {
                         Some(wm) if wm.last_id > 0 && !wm.primary_key.trim().is_empty() => {
                             wm.last_id
                         }
@@ -1056,10 +1108,54 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                     if let Some(ref pk_col) = pk_col_opt {
                         let safe_pk =
                             sanitize_identifier(pk_col).unwrap_or_else(|_| format!("`{}`", pk_col));
+                        let updated_at_col = updated_at_tables_c
+                            .contains(table_name)
+                            .then(|| "`updated_at`".to_string());
+                        let watermark_timestamp = watermark
+                            .and_then(|wm| wm.last_sync_time.as_deref())
+                            .and_then(normalize_mysql_timestamp);
+                        let update_filter = if watermark_id > 0 {
+                            updated_at_col
+                                .as_deref()
+                                .zip(watermark_timestamp.as_deref())
+                                .map(|(column, timestamp)| (watermark_id, column, timestamp))
+                        } else {
+                            None
+                        };
+                        let use_updated_at_filter = update_filter.is_some();
+                        let start_id = if watermark_id > 0 && !use_updated_at_filter {
+                            emit_log(
+                                &app_c,
+                                "warning",
+                                format!(
+                                    "[Tabel '{}'] Kolom updated_at atau waktu watermark tidak tersedia; incremental memakai full upsert untuk menangkap perubahan baris lama.",
+                                    table_name
+                                ),
+                            );
+                            0
+                        } else if use_updated_at_filter {
+                            0
+                        } else {
+                            watermark_id
+                        };
                         let mut current_last_id = start_id;
                         let mut chunk_num = 1;
 
-                        if start_id > 0 {
+                        if let Some((_, _, timestamp)) = update_filter {
+                            emit_log(
+                                &app_c,
+                                "info",
+                                format!(
+                                    "[{}/{}] ⚡ [Worker {}] Sync baris baru dan perubahan '{}' sejak {} (PK: {})...",
+                                    idx + 1,
+                                    total_tables,
+                                    worker_id + 1,
+                                    table_name,
+                                    timestamp,
+                                    pk_col
+                                ),
+                            );
+                        } else if start_id > 0 {
                             emit_log(
                                 &app_c,
                                 "info",
@@ -1104,71 +1200,85 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
                             // Fast index-only covering scan to find upper bound of this chunk
                             let bound_q = format!(
-                                "SELECT MAX(t.pk) FROM (SELECT {} AS pk FROM {} WHERE {} > {} ORDER BY {} ASC LIMIT {}) AS t",
+                                "SELECT MAX(t.pk), COUNT(*) FROM (SELECT {} AS pk FROM {} WHERE {} > {} ORDER BY {} ASC LIMIT {}) AS t",
                                 safe_pk, safe_table, safe_pk, current_last_id, safe_pk, this_chunk_limit
                             );
 
-                            let max_pk_in_chunk: Option<i64> = match sqlx::query(&bound_q)
-                                .fetch_one(&*pool_c)
-                                .await
-                            {
-                                Ok(row) => match row.try_get::<Option<i64>, _>(0) {
-                                    Ok(value) => value,
-                                    Err(signed_error) => match row.try_get::<Option<u64>, _>(0) {
-                                        Ok(Some(value)) => match i64::try_from(value) {
-                                            Ok(value) => Some(value),
-                                            Err(_) => {
+                            let (max_pk_in_chunk, keys_in_chunk): (Option<i64>, u64) =
+                                match sqlx::query(&bound_q).fetch_one(&*pool_c).await {
+                                    Ok(row) => {
+                                        let max_pk = match row.try_get::<Option<i64>, _>(0) {
+                                            Ok(value) => value,
+                                            Err(signed_error) => {
+                                                match row.try_get::<Option<u64>, _>(0) {
+                                                    Ok(Some(value)) => match i64::try_from(value) {
+                                                        Ok(value) => Some(value),
+                                                        Err(_) => {
+                                                            record_failure(
+                                                        &app_c,
+                                                        &failures_p,
+                                                        Some(table_name),
+                                                        "Mencari batas data tabel",
+                                                        "Nilai primary key melebihi rentang integer yang didukung",
+                                                    );
+                                                            break;
+                                                        }
+                                                    },
+                                                    Ok(None) => None,
+                                                    Err(unsigned_error) => {
+                                                        record_failure(
+                                                            &app_c,
+                                                            &failures_p,
+                                                            Some(table_name),
+                                                            "Membaca batas primary key",
+                                                            format!(
+                                                        "Tipe primary key tidak didukung: {}; {}",
+                                                        signed_error, unsigned_error
+                                                    ),
+                                                        );
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        };
+                                        let key_count = match row.try_get::<u64, _>(1) {
+                                            Ok(value) => value,
+                                            Err(e) => {
                                                 record_failure(
                                                     &app_c,
                                                     &failures_p,
                                                     Some(table_name),
-                                                    "Mencari batas data tabel",
-                                                    "Nilai primary key melebihi rentang integer yang didukung",
+                                                    "Membaca jumlah baris chunk",
+                                                    e.to_string(),
                                                 );
                                                 break;
                                             }
-                                        },
-                                        Ok(None) => None,
-                                        Err(unsigned_error) => {
-                                            record_failure(
-                                                &app_c,
-                                                &failures_p,
-                                                Some(table_name),
-                                                "Membaca batas primary key",
-                                                format!(
-                                                    "Tipe primary key tidak didukung: {}; {}",
-                                                    signed_error, unsigned_error
-                                                ),
-                                            );
-                                            break;
-                                        }
-                                    },
-                                },
-                                Err(e) => {
-                                    record_failure(
-                                        &app_c,
-                                        &failures_p,
-                                        Some(table_name),
-                                        "Mencari batas chunk data remote",
-                                        e.to_string(),
-                                    );
-                                    break;
-                                }
-                            };
+                                        };
+                                        (max_pk, key_count)
+                                    }
+                                    Err(e) => {
+                                        record_failure(
+                                            &app_c,
+                                            &failures_p,
+                                            Some(table_name),
+                                            "Mencari batas chunk data remote",
+                                            e.to_string(),
+                                        );
+                                        break;
+                                    }
+                                };
 
                             let chunk_max = match max_pk_in_chunk {
                                 Some(m) if m > current_last_id => m,
                                 _ => break, // No more rows in table!
                             };
 
-                            let where_clause = if current_last_id == 0 {
-                                format!("--where={} <= {}", safe_pk, chunk_max)
-                            } else {
-                                format!(
-                                    "--where={} > {} AND {} <= {}",
-                                    safe_pk, current_last_id, safe_pk, chunk_max
-                                )
-                            };
+                            let where_clause = build_chunk_where_clause(
+                                &safe_pk,
+                                current_last_id,
+                                chunk_max,
+                                update_filter,
+                            );
 
                             match dump_table_chunk_to_bytes(
                                 tunnel_port,
@@ -1205,7 +1315,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                     current_last_id = chunk_max;
                                     chunk_num += 1;
 
-                                    if rows_in_chunk < this_chunk_limit {
+                                    if keys_in_chunk < this_chunk_limit as u64 {
                                         break;
                                     }
                                 }
@@ -1381,6 +1491,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         total_tables: completed_table_count,
         total_rows_synced: total_rows_all_tables,
         duration_ms: duration.as_millis() as u64,
+        sync_timestamp: Some(sync_timestamp),
         error: match status {
             "success" => None,
             "partial" => Some(format!(
@@ -1443,7 +1554,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_sync_status;
+    use super::{build_chunk_where_clause, normalize_mysql_timestamp, resolve_sync_status};
 
     #[test]
     fn sync_status_is_success_only_when_everything_finishes_cleanly() {
@@ -1468,5 +1579,41 @@ mod tests {
     #[test]
     fn sync_status_keeps_cancellation_distinct_from_failure() {
         assert_eq!(resolve_sync_status(true, true, false, true), "cancelled");
+    }
+
+    #[test]
+    fn mysql_watermark_timestamp_accepts_remote_datetime_format() {
+        assert_eq!(
+            normalize_mysql_timestamp("2026-06-02 13:14:15.123456").as_deref(),
+            Some("2026-06-02 13:14:15.123456")
+        );
+    }
+
+    #[test]
+    fn mysql_watermark_timestamp_rejects_local_iso_timestamp() {
+        assert_eq!(normalize_mysql_timestamp("2026-06-02T13:14:15.123Z"), None);
+    }
+
+    #[test]
+    fn incremental_chunk_filter_includes_updated_rows_below_id_watermark() {
+        let clause = build_chunk_where_clause(
+            "`id`",
+            0,
+            500,
+            Some((900, "`updated_at`", "2026-06-02 13:14:15.123456")),
+        );
+
+        assert_eq!(
+            clause,
+            "--where=(`id` > 900 OR `updated_at` >= '2026-06-02 13:14:15.123456') AND `id` <= 500"
+        );
+    }
+
+    #[test]
+    fn incremental_chunk_filter_preserves_keyset_range_without_timestamp_watermark() {
+        assert_eq!(
+            build_chunk_where_clause("`id`", 100, 500, None),
+            "--where=`id` > 100 AND `id` <= 500"
+        );
     }
 }

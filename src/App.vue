@@ -323,10 +323,10 @@ async function handleStartSync(syncOptions) {
       historyList.value = addHistoryEntry(newEntry);
 
       if (status === 'success') {
-        const nowIso = new Date().toISOString();
+        const lastSyncTime = res.sync_timestamp || new Date().toISOString();
         for (const tableName of selectedTables) {
           saveTableState(syncingProfile.id, tableName, {
-            lastSyncTime: nowIso,
+            lastSyncTime,
           });
         }
         if (activeProfileId.value === syncingProfile.id) {
