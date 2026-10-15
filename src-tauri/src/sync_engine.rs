@@ -1,7 +1,7 @@
 use crate::local_db::{ensure_local_database_exists, sanitize_identifier, spawn_mysql_child};
 use crate::models::{
-    LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig, SyncFailure,
-    SyncOptions, SyncResult, TableInfo,
+    incremental_primary_key, LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig,
+    SyncFailure, SyncOptions, SyncResult, TableInfo,
 };
 use crate::ssh_client::{establish_ssh_session, start_ssh_tunnel};
 use sqlx::mysql::MySqlPoolOptions;
@@ -148,17 +148,13 @@ fn normalize_mysql_timestamp(value: &str) -> Option<String> {
 
 fn build_chunk_where_clause(
     safe_pk: &str,
-    current_last_id: i64,
+    current_last_id: Option<i64>,
     chunk_max: i64,
     update_filter: Option<(i64, &str, &str)>,
 ) -> String {
-    let range_condition = if current_last_id == 0 {
-        format!("{} <= {}", safe_pk, chunk_max)
-    } else {
-        format!(
-            "{} > {} AND {} <= {}",
-            safe_pk, current_last_id, safe_pk, chunk_max
-        )
+    let range_condition = match current_last_id {
+        Some(last_id) => format!("{} > {} AND {} <= {}", safe_pk, last_id, safe_pk, chunk_max),
+        None => format!("{} <= {}", safe_pk, chunk_max),
     };
     let condition = match update_filter {
         Some((watermark_id, updated_at_col, timestamp)) => format!(
@@ -565,12 +561,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
     // Pre-query primary keys and update timestamp columns in batch queries.
     let pk_query = "
-        SELECT TABLE_NAME, COLUMN_NAME 
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE
         FROM information_schema.COLUMNS 
         WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI'
         ORDER BY ORDINAL_POSITION ASC
     ";
-    let mut pk_map: HashMap<String, String> = HashMap::new();
+    let mut pk_columns: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     let rows = sqlx::query(pk_query)
         .fetch_all(&*remote_pool)
         .await
@@ -578,10 +574,21 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     for r in rows {
         let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
         let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
-        if !t_name.is_empty() && !c_name.is_empty() && !pk_map.contains_key(&t_name) {
-            pk_map.insert(t_name, c_name);
+        let data_type: String = r.try_get("DATA_TYPE").unwrap_or_default();
+        let column_type: String = r.try_get("COLUMN_TYPE").unwrap_or_default();
+        if !t_name.is_empty() && !c_name.is_empty() {
+            pk_columns
+                .entry(t_name)
+                .or_default()
+                .push((c_name, data_type, column_type));
         }
     }
+    let pk_map: HashMap<String, String> = pk_columns
+        .iter()
+        .filter_map(|(table, columns)| {
+            incremental_primary_key(columns).map(|column| (table.clone(), column))
+        })
+        .collect();
     let pk_map = Arc::new(pk_map);
 
     let updated_at_query = "
@@ -1096,16 +1103,13 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         None
                     };
 
-                    let watermark_id = match watermark {
-                        Some(wm) if wm.last_id > 0 && !wm.primary_key.trim().is_empty() => {
-                            wm.last_id
-                        }
-                        _ => 0,
-                    };
-
                     let mut total_table_rows = 0usize;
 
                     if let Some(ref pk_col) = pk_col_opt {
+                        let watermark_id = watermark.and_then(|wm| {
+                            (wm.last_id > 0 && wm.primary_key.eq_ignore_ascii_case(pk_col.as_str()))
+                                .then_some(wm.last_id)
+                        });
                         let safe_pk =
                             sanitize_identifier(pk_col).unwrap_or_else(|_| format!("`{}`", pk_col));
                         let updated_at_col = updated_at_tables_c
@@ -1114,16 +1118,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         let watermark_timestamp = watermark
                             .and_then(|wm| wm.last_sync_time.as_deref())
                             .and_then(normalize_mysql_timestamp);
-                        let update_filter = if watermark_id > 0 {
-                            updated_at_col
-                                .as_deref()
-                                .zip(watermark_timestamp.as_deref())
-                                .map(|(column, timestamp)| (watermark_id, column, timestamp))
-                        } else {
-                            None
-                        };
+                        let update_filter = watermark_id
+                            .zip(updated_at_col.as_deref())
+                            .zip(watermark_timestamp.as_deref())
+                            .map(|((id, column), timestamp)| (id, column, timestamp));
                         let use_updated_at_filter = update_filter.is_some();
-                        let start_id = if watermark_id > 0 && !use_updated_at_filter {
+                        let start_id = if watermark_id.is_some() && !use_updated_at_filter {
                             emit_log(
                                 &app_c,
                                 "warning",
@@ -1132,9 +1132,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                     table_name
                                 ),
                             );
-                            0
+                            None
                         } else if use_updated_at_filter {
-                            0
+                            None
                         } else {
                             watermark_id
                         };
@@ -1155,7 +1155,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                     pk_col
                                 ),
                             );
-                        } else if start_id > 0 {
+                        } else if let Some(start_id) = start_id {
                             emit_log(
                                 &app_c,
                                 "info",
@@ -1199,9 +1199,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             };
 
                             // Fast index-only covering scan to find upper bound of this chunk
+                            let bound_condition = current_last_id
+                                .map(|last_id| format!("{} > {}", safe_pk, last_id))
+                                .unwrap_or_else(|| "1=1".to_string());
                             let bound_q = format!(
-                                "SELECT MAX(t.pk), COUNT(*) FROM (SELECT {} AS pk FROM {} WHERE {} > {} ORDER BY {} ASC LIMIT {}) AS t",
-                                safe_pk, safe_table, safe_pk, current_last_id, safe_pk, this_chunk_limit
+                                "SELECT MAX(t.pk), COUNT(*) FROM (SELECT {} AS pk FROM {} WHERE {} ORDER BY {} ASC LIMIT {}) AS t",
+                                safe_pk, safe_table, bound_condition, safe_pk, this_chunk_limit
                             );
 
                             let (max_pk_in_chunk, keys_in_chunk): (Option<i64>, u64) =
@@ -1269,7 +1272,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 };
 
                             let chunk_max = match max_pk_in_chunk {
-                                Some(m) if m > current_last_id => m,
+                                Some(m) if current_last_id.is_none_or(|last_id| m > last_id) => m,
                                 _ => break, // No more rows in table!
                             };
 
@@ -1312,7 +1315,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                         break;
                                     }
 
-                                    current_last_id = chunk_max;
+                                    current_last_id = Some(chunk_max);
                                     chunk_num += 1;
 
                                     if keys_in_chunk < this_chunk_limit as u64 {
@@ -1334,7 +1337,14 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             }
                         }
                     } else {
-                        // Table has no single PK: dump as single chunk
+                        emit_log(
+                            &app_c,
+                            "warning",
+                            format!(
+                                "[Tabel '{}'] Primary key bukan satu kolom integer bertanda; memakai full upsert agar PK teks/komposit tidak melewatkan baris.",
+                                table_name
+                            ),
+                        );
                         let where_clause = match row_limit_opt {
                             Some(lim) if lim > 0 => format!("--where=1 LIMIT {}", lim),
                             _ => String::new(),
@@ -1598,7 +1608,7 @@ mod tests {
     fn incremental_chunk_filter_includes_updated_rows_below_id_watermark() {
         let clause = build_chunk_where_clause(
             "`id`",
-            0,
+            None,
             500,
             Some((900, "`updated_at`", "2026-06-02 13:14:15.123456")),
         );
@@ -1612,8 +1622,16 @@ mod tests {
     #[test]
     fn incremental_chunk_filter_preserves_keyset_range_without_timestamp_watermark() {
         assert_eq!(
-            build_chunk_where_clause("`id`", 100, 500, None),
+            build_chunk_where_clause("`id`", Some(100), 500, None),
             "--where=`id` > 100 AND `id` <= 500"
+        );
+    }
+
+    #[test]
+    fn first_chunk_includes_zero_and_negative_primary_keys() {
+        assert_eq!(
+            build_chunk_where_clause("`id`", None, 500, None),
+            "--where=`id` <= 500"
         );
     }
 }

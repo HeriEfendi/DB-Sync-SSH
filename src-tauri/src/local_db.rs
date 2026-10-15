@@ -1,4 +1,4 @@
-use crate::models::LocalDbConfig;
+use crate::models::{incremental_primary_key, LocalDbConfig};
 use crate::process_utils::new_tokio_command;
 use sqlx::{mysql::MySqlPoolOptions, Row};
 use std::process::Stdio;
@@ -376,7 +376,7 @@ pub async fn get_all_tables_last_local_ids(
 
     // 1. Get primary keys for tables in the local database
     let pk_query = "
-        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE
         FROM information_schema.COLUMNS
         WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI'
         ORDER BY ORDINAL_POSITION ASC
@@ -387,14 +387,25 @@ pub async fn get_all_tables_last_local_ids(
         .unwrap_or_default();
 
     use std::collections::HashMap;
-    let mut pk_map: HashMap<String, String> = HashMap::new();
+    let mut pk_columns: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
     for r in pk_rows {
         let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
         let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
-        if !t_name.is_empty() && !c_name.is_empty() && !pk_map.contains_key(&t_name) {
-            pk_map.insert(t_name, c_name);
+        let data_type: String = r.try_get("DATA_TYPE").unwrap_or_default();
+        let column_type: String = r.try_get("COLUMN_TYPE").unwrap_or_default();
+        if !t_name.is_empty() && !c_name.is_empty() {
+            pk_columns
+                .entry(t_name)
+                .or_default()
+                .push((c_name, data_type, column_type));
         }
     }
+    let pk_map: HashMap<String, String> = pk_columns
+        .iter()
+        .filter_map(|(table, columns)| {
+            incremental_primary_key(columns).map(|column| (table.clone(), column))
+        })
+        .collect();
 
     // 2. Target tables list
     let target_tables = match tables {
@@ -433,10 +444,7 @@ pub async fn get_all_tables_last_local_ids(
                         max_id = Some(val);
                         max_id_str = Some(val.to_string());
                     } else if let Ok(val) = row.try_get::<u64, _>(0) {
-                        max_id = Some(val as i64);
-                        max_id_str = Some(val.to_string());
-                    } else if let Ok(val) = row.try_get::<i32, _>(0) {
-                        max_id = Some(val as i64);
+                        max_id = i64::try_from(val).ok();
                         max_id_str = Some(val.to_string());
                     } else if let Ok(val) = row.try_get::<String, _>(0) {
                         max_id = val.parse::<i64>().ok();

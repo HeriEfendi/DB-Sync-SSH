@@ -17,6 +17,7 @@ Designed to synchronize remote MySQL / MariaDB databases securely across **SSH t
   * Mempertahankan struktur yang ada (`CREATE TABLE IF NOT EXISTS`).
   * Menggunakan watermark **Last ID** dan waktu server remote. Tabel dengan kolom `updated_at` menyalin baris baru serta perubahan yang dibuat sejak sinkronisasi berhasil sebelumnya.
   * Tabel tanpa `updated_at` (atau watermark waktu yang valid) memakai full upsert dengan `REPLACE INTO` agar perubahan pada baris lama tidak terlewat; ini lebih akurat tetapi dapat mentransfer lebih banyak data.
+  * Keyset incremental hanya dipakai untuk primary key tunggal bertipe integer bertanda. Primary key teks, unsigned, dan komposit memakai full upsert agar nilai key tidak salah dibaca atau membuat baris terlewat.
 
 ### 2. ⚡ Multi-Worker Pipeline Architecture
 Mengadopsi pola asinkron tingkat tinggi (Producer-Consumer over SSH):

@@ -136,11 +136,9 @@ async function detectAndSyncLocalIds(tableList = null) {
         const existing = tableStatesMap.value[info.table_name] || {};
         const updated = {
           ...existing,
-          primaryKey: info.primary_key || existing.primaryKey || 'id',
+          primaryKey: info.primary_key,
+          lastSyncedId: info.max_id,
         };
-        if (info.max_id !== null && info.max_id !== undefined) {
-          updated.lastSyncedId = info.max_id;
-        }
         saveTableState(activeProfile.value.id, info.table_name, updated);
       }
       refreshLocalTableStates();
