@@ -1,7 +1,7 @@
 use crate::local_db::{ensure_local_database_exists, sanitize_identifier, spawn_mysql_child};
 use crate::models::{
-    LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig, SyncOptions, SyncResult,
-    TableInfo,
+    LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig, SyncFailure,
+    SyncOptions, SyncResult, TableInfo,
 };
 use crate::ssh_client::{establish_ssh_session, start_ssh_tunnel};
 use sqlx::mysql::MySqlPoolOptions;
@@ -68,14 +68,113 @@ pub fn cancel_sync() {
     kill_all_child_processes();
 }
 
-pub fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, log_type: &str, message: impl Into<String>) {
+pub fn emit_log<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    log_type: &str,
+    message: impl Into<String>,
+) {
     let now = chrono::Local::now().format("%H:%M:%S").to_string();
     let payload = LogPayload {
         r#type: log_type.to_string(),
         message: message.into(),
         timestamp: now,
+        details: None,
+        table_name: None,
     };
     let _ = app.emit("sync-log", payload);
+}
+
+fn record_failure<R: tauri::Runtime>(
+    app: &tauri::AppHandle<R>,
+    failures: &Arc<Mutex<Vec<SyncFailure>>>,
+    table_name: Option<&str>,
+    stage: &str,
+    message: impl Into<String>,
+) {
+    let message = message.into();
+    let failure = SyncFailure {
+        table_name: table_name.map(str::to_string),
+        stage: stage.to_string(),
+        message: message.clone(),
+    };
+    failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(failure);
+
+    let table_prefix = table_name
+        .map(|name| format!("[Tabel '{}'] ", name))
+        .unwrap_or_default();
+    let payload = LogPayload {
+        r#type: "error".to_string(),
+        message: format!("{}{} gagal", table_prefix, stage),
+        timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+        details: Some(message),
+        table_name: table_name.map(str::to_string),
+    };
+    let _ = app.emit("sync-log", payload);
+}
+
+fn table_has_failure(failures: &Arc<Mutex<Vec<SyncFailure>>>, table_name: &str) -> bool {
+    failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|failure| failure.table_name.as_deref() == Some(table_name))
+}
+
+fn resolve_sync_status(
+    was_cancelled: bool,
+    fatal_failure: bool,
+    all_tables_processed: bool,
+    has_failures: bool,
+) -> &'static str {
+    if was_cancelled {
+        "cancelled"
+    } else if fatal_failure || !all_tables_processed {
+        "failed"
+    } else if has_failures {
+        "partial"
+    } else {
+        "success"
+    }
+}
+
+fn check_importer_running<R: tauri::Runtime>(
+    child: &mut tokio::process::Child,
+    app: &tauri::AppHandle<R>,
+    failures: &Arc<Mutex<Vec<SyncFailure>>>,
+    fatal_failure: &AtomicBool,
+    table_name: &str,
+) -> bool {
+    match child.try_wait() {
+        Ok(None) => true,
+        Ok(Some(status)) => {
+            fatal_failure.store(true, Ordering::SeqCst);
+            record_failure(
+                app,
+                failures,
+                Some(table_name),
+                "Importer MySQL lokal",
+                format!(
+                    "Proses berhenti sebelum seluruh input selesai (status {})",
+                    status
+                ),
+            );
+            false
+        }
+        Err(e) => {
+            fatal_failure.store(true, Ordering::SeqCst);
+            record_failure(
+                app,
+                failures,
+                Some(table_name),
+                "Memeriksa proses importer MySQL lokal",
+                e.to_string(),
+            );
+            false
+        }
+    }
 }
 
 pub fn emit_progress<R: tauri::Runtime>(
@@ -122,7 +221,12 @@ pub async fn test_ssh_and_remote_db(
         .acquire_timeout(std::time::Duration::from_secs(8))
         .connect(&tunnel_conn_str)
         .await
-        .map_err(|e| format!("Koneksi SSH berhasil, namun gagal terhubung ke MySQL remote: {}", e))?;
+        .map_err(|e| {
+            format!(
+                "Koneksi SSH berhasil, namun gagal terhubung ke MySQL remote: {}",
+                e
+            )
+        })?;
 
     let row: (String,) = sqlx::query_as("SELECT VERSION()")
         .fetch_one(&pool)
@@ -274,12 +378,31 @@ async fn dump_table_chunk_to_bytes(
         .spawn()
         .map_err(|e| format!("Gagal menjalankan mysqldump: {}", e))?;
 
-    if let Some(pid) = dump_child.id() {
+    let dump_pid = dump_child.id();
+    if let Some(pid) = dump_pid {
         register_child_pid(pid);
     }
 
     let mut output_bytes = Vec::new();
     let mut rows_count = 0usize;
+    let mut stderr = dump_child
+        .stderr
+        .take()
+        .ok_or_else(|| "Gagal membaca STDERR proses mysqldump".to_string())?;
+    let stderr_task = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 8192];
+        loop {
+            let count = stderr.read(&mut buffer).await?;
+            if count == 0 {
+                break;
+            }
+            let remaining = (64 * 1024usize).saturating_sub(output.len());
+            output.extend_from_slice(&buffer[..count.min(remaining)]);
+        }
+        Ok::<String, std::io::Error>(String::from_utf8_lossy(&output).trim().to_string())
+    });
 
     if let Some(mut stdout) = dump_child.stdout.take() {
         use tokio::io::AsyncReadExt;
@@ -302,15 +425,42 @@ async fn dump_table_chunk_to_bytes(
                     output_bytes.extend_from_slice(chunk);
                 }
                 Err(e) => {
+                    let _ = dump_child.kill().await;
+                    let _ = dump_child.wait().await;
+                    if let Some(pid) = dump_pid {
+                        unregister_child_pid(pid);
+                    }
+                    let _ = stderr_task.await;
                     return Err(format!("Gagal membaca stream mysqldump: {}", e));
                 }
             }
         }
     }
 
-    let _ = dump_child.wait().await;
-    if let Some(pid) = dump_child.id() {
+    let status = match dump_child.wait().await {
+        Ok(status) => status,
+        Err(e) => {
+            if let Some(pid) = dump_pid {
+                unregister_child_pid(pid);
+            }
+            return Err(format!("Gagal menunggu proses mysqldump: {}", e));
+        }
+    };
+    if let Some(pid) = dump_pid {
         unregister_child_pid(pid);
+    }
+    let stderr_output = stderr_task
+        .await
+        .map_err(|e| format!("Gagal mengambil keluaran error mysqldump: {}", e))?
+        .map_err(|e| format!("Gagal membaca STDERR mysqldump: {}", e))?;
+
+    if !is_cancelled() && !status.success() {
+        let message = if stderr_output.is_empty() {
+            format!("mysqldump berhenti dengan status {}", status)
+        } else {
+            stderr_output
+        };
+        return Err(message);
     }
 
     Ok((output_bytes, rows_count))
@@ -326,16 +476,28 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     reset_cancel_state();
     let start_time = Instant::now();
 
-    emit_log(&app, "info", "🚀 Memulai inisialisasi sinkronisasi DB over SSH...");
+    emit_log(
+        &app,
+        "info",
+        "🚀 Memulai inisialisasi sinkronisasi DB over SSH...",
+    );
 
     // 1. Ensure local database exists
     if let Err(e) = ensure_local_database_exists(&local_db_config).await {
-        emit_log(&app, "error", format!("Gagal memverifikasi database lokal: {}", e));
+        emit_log(
+            &app,
+            "error",
+            format!("Gagal memverifikasi database lokal: {}", e),
+        );
         return Err(e);
     }
 
     // 2. Open SSH port forward tunnel
-    emit_log(&app, "info", format!("🔌 Menghubungkan SSH tunnel ke {}...", ssh_config.host));
+    emit_log(
+        &app,
+        "info",
+        format!("🔌 Menghubungkan SSH tunnel ke {}...", ssh_config.host),
+    );
     let tunnel = match start_ssh_tunnel(&ssh_config, &remote_db_config) {
         Ok(t) => t,
         Err(e) => {
@@ -362,7 +524,11 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     {
         Ok(p) => Arc::new(p),
         Err(e) => {
-            emit_log(&app, "error", format!("Koneksi MySQL remote via tunnel gagal: {}", e));
+            emit_log(
+                &app,
+                "error",
+                format!("Koneksi MySQL remote via tunnel gagal: {}", e),
+            );
             return Err(e.to_string());
         }
     };
@@ -375,13 +541,15 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         ORDER BY ORDINAL_POSITION ASC
     ";
     let mut pk_map: HashMap<String, String> = HashMap::new();
-    if let Ok(rows) = sqlx::query(pk_query).fetch_all(&*remote_pool).await {
-        for r in rows {
-            let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
-            let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
-            if !t_name.is_empty() && !c_name.is_empty() && !pk_map.contains_key(&t_name) {
-                pk_map.insert(t_name, c_name);
-            }
+    let rows = sqlx::query(pk_query)
+        .fetch_all(&*remote_pool)
+        .await
+        .map_err(|e| format!("Gagal membaca metadata primary key remote: {}", e))?;
+    for r in rows {
+        let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
+        let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
+        if !t_name.is_empty() && !c_name.is_empty() && !pk_map.contains_key(&t_name) {
+            pk_map.insert(t_name, c_name);
         }
     }
     let pk_map = Arc::new(pk_map);
@@ -393,7 +561,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
     emit_log(
         &app,
-        "success",
+        "info",
         format!(
             "🚀 Memulai Pipeline Sync ({} tabel, {} Remote SSH Download Workers, 1 Local Import Worker, Mode: {})...",
             total_tables,
@@ -406,92 +574,246 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let (tx, mut rx) = tokio::sync::mpsc::channel::<PipelineMsg>(4);
 
     let tables_queue = Arc::new(tokio::sync::Mutex::new(
-        sync_options.tables.into_iter().enumerate().collect::<VecDeque<_>>()
+        sync_options
+            .tables
+            .into_iter()
+            .enumerate()
+            .collect::<VecDeque<_>>(),
     ));
     let incremental_watermarks = Arc::new(sync_options.incremental_watermarks);
     let remote_db_cfg = Arc::new(remote_db_config);
+    let failures_consumer = Arc::new(Mutex::new(Vec::<SyncFailure>::new()));
+    let failures = failures_consumer.clone();
+    let fatal_failure = Arc::new(AtomicBool::new(false));
 
     // ----------------------------------------------------
     // Consumer Task: Local MySQL Importer Worker
     // ----------------------------------------------------
     let local_cfg_c = local_db_config.clone();
     let app_consumer = app.clone();
+    let failures_c = failures_consumer.clone();
+    let fatal_failure_c = fatal_failure.clone();
     let total_tables_c = total_tables;
 
     let consumer_handle = tokio::spawn(async move {
-        let (mut local_child, mut local_stdin, _) = match spawn_mysql_child(&local_cfg_c) {
-            Ok(c) => c,
-            Err(e) => {
-                emit_log(&app_consumer, "error", format!("Gagal menjalankan proses import MySQL lokal: {}", e));
-                return Err(e);
-            }
-        };
-        if let Some(pid) = local_child.id() {
+        let (mut local_child, mut local_stdin, mut local_stderr) =
+            match spawn_mysql_child(&local_cfg_c) {
+                Ok(c) => c,
+                Err(e) => {
+                    fatal_failure_c.store(true, Ordering::SeqCst);
+                    record_failure(
+                        &app_consumer,
+                        &failures_c,
+                        None,
+                        "Menjalankan importer MySQL lokal",
+                        &e,
+                    );
+                    return Err(e);
+                }
+            };
+        let local_pid = local_child.id();
+        if let Some(pid) = local_pid {
             register_child_pid(pid);
         }
+        let stderr_task = tokio::spawn(async move {
+            use tokio::io::AsyncReadExt;
+            let mut output = Vec::new();
+            let mut buffer = [0u8; 8192];
+            loop {
+                let count = local_stderr.read(&mut buffer).await?;
+                if count == 0 {
+                    break;
+                }
+                let remaining = (64 * 1024usize).saturating_sub(output.len());
+                output.extend_from_slice(&buffer[..count.min(remaining)]);
+            }
+            Ok::<String, std::io::Error>(String::from_utf8_lossy(&output).trim().to_string())
+        });
 
         use tokio::io::AsyncWriteExt;
         let prelude = "SET SESSION sql_log_bin=0;\nSET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\n";
-        let _ = local_stdin.write_all(prelude.as_bytes()).await;
+        if let Err(e) = local_stdin.write_all(prelude.as_bytes()).await {
+            fatal_failure_c.store(true, Ordering::SeqCst);
+            record_failure(
+                &app_consumer,
+                &failures_c,
+                None,
+                "Menyiapkan sesi MySQL lokal",
+                e.to_string(),
+            );
+        }
 
         let mut total_rows_imported = 0usize;
         let mut completed_tables = 0usize;
+        let mut touched_tables = std::collections::HashSet::new();
+        let mut stdin_failed = false;
 
         while let Some(msg) = rx.recv().await {
             if is_cancelled() {
                 break;
             }
             match msg {
-                PipelineMsg::Ddl { table_name, table_index: _, sql } => {
-                    if let Err(e) = local_stdin.write_all(sql.as_bytes()).await {
-                        emit_log(&app_consumer, "error", format!("[Tabel '{}'] Gagal menerapkan DDL lokal: {}", table_name, e));
+                PipelineMsg::Ddl {
+                    table_name,
+                    table_index: _,
+                    sql,
+                } => {
+                    touched_tables.insert(table_name.clone());
+                    if stdin_failed {
+                        record_failure(
+                            &app_consumer,
+                            &failures_c,
+                            Some(&table_name),
+                            "Mengirim struktur ke MySQL lokal",
+                            "Koneksi stdin importer sudah terputus; DDL tidak diterapkan",
+                        );
+                    } else if let Err(e) = local_stdin.write_all(sql.as_bytes()).await {
+                        stdin_failed = true;
+                        fatal_failure_c.store(true, Ordering::SeqCst);
+                        record_failure(
+                            &app_consumer,
+                            &failures_c,
+                            Some(&table_name),
+                            "Mengirim struktur ke MySQL lokal",
+                            e.to_string(),
+                        );
                     } else {
-                        let _ = local_stdin.flush().await;
-                        emit_log(&app_consumer, "success", format!("[Tabel '{}'] ✅ Struktur DDL diterapkan ke MySQL lokal.", table_name));
-                    }
-                }
-                PipelineMsg::DataChunk { table_name, table_index, chunk_num, sql_bytes, row_count } => {
-                    if !sql_bytes.is_empty() {
-                        if let Err(e) = local_stdin.write_all(&sql_bytes).await {
-                            emit_log(&app_consumer, "error", format!("[Tabel '{}'] Gagal menulis data chunk ke MySQL lokal: {}", table_name, e));
+                        if let Err(e) = local_stdin.flush().await {
+                            stdin_failed = true;
+                            fatal_failure_c.store(true, Ordering::SeqCst);
+                            record_failure(
+                                &app_consumer,
+                                &failures_c,
+                                Some(&table_name),
+                                "Flush struktur ke MySQL lokal",
+                                e.to_string(),
+                            );
                         } else {
-                            let _ = local_stdin.flush().await;
+                            if !check_importer_running(
+                                &mut local_child,
+                                &app_consumer,
+                                &failures_c,
+                                &fatal_failure_c,
+                                &table_name,
+                            ) {
+                                stdin_failed = true;
+                            } else {
+                                emit_log(
+                                    &app_consumer,
+                                    "info",
+                                    format!(
+                                        "[Tabel '{}'] Struktur dikirim ke MySQL lokal.",
+                                        table_name
+                                    ),
+                                );
+                            }
                         }
                     }
-                    total_rows_imported += row_count;
+                }
+                PipelineMsg::DataChunk {
+                    table_name,
+                    table_index,
+                    chunk_num,
+                    sql_bytes,
+                    row_count,
+                } => {
+                    touched_tables.insert(table_name.clone());
+                    let mut chunk_written = if sql_bytes.is_empty() {
+                        true
+                    } else if stdin_failed {
+                        record_failure(
+                            &app_consumer,
+                            &failures_c,
+                            Some(&table_name),
+                            "Mengirim data ke MySQL lokal",
+                            format!(
+                                "Chunk {} tidak dikirim karena stdin importer terputus",
+                                chunk_num
+                            ),
+                        );
+                        false
+                    } else if let Err(e) = local_stdin.write_all(&sql_bytes).await {
+                        stdin_failed = true;
+                        fatal_failure_c.store(true, Ordering::SeqCst);
+                        record_failure(
+                            &app_consumer,
+                            &failures_c,
+                            Some(&table_name),
+                            "Mengirim data ke MySQL lokal",
+                            format!("Chunk {}: {}", chunk_num, e),
+                        );
+                        false
+                    } else if let Err(e) = local_stdin.flush().await {
+                        stdin_failed = true;
+                        fatal_failure_c.store(true, Ordering::SeqCst);
+                        record_failure(
+                            &app_consumer,
+                            &failures_c,
+                            Some(&table_name),
+                            "Flush data ke MySQL lokal",
+                            format!("Chunk {}: {}", chunk_num, e),
+                        );
+                        false
+                    } else {
+                        true
+                    };
+
+                    if chunk_written
+                        && !sql_bytes.is_empty()
+                        && !check_importer_running(
+                            &mut local_child,
+                            &app_consumer,
+                            &failures_c,
+                            &fatal_failure_c,
+                            &table_name,
+                        )
+                    {
+                        stdin_failed = true;
+                        chunk_written = false;
+                    }
+
+                    if chunk_written {
+                        total_rows_imported += row_count;
+                        if row_count > 0 {
+                            emit_log(
+                                &app_consumer,
+                                "info",
+                                format!(
+                                    "[Tabel '{}'] 📦 Chunk {} dikirim (~{} baris)...",
+                                    table_name,
+                                    chunk_num,
+                                    format_number(row_count)
+                                ),
+                            );
+                        }
+                    }
                     emit_progress(
                         &app_consumer,
                         table_index,
                         total_tables_c,
                         &table_name,
-                        row_count,
+                        if chunk_written { row_count } else { 0 },
                         total_rows_imported,
                         "syncing",
                     );
-                    if row_count > 0 {
+                }
+                PipelineMsg::TableFinished {
+                    table_name,
+                    table_index,
+                    total_rows_synced,
+                } => {
+                    completed_tables += 1;
+                    if !table_has_failure(&failures_c, &table_name) {
                         emit_log(
                             &app_consumer,
                             "info",
                             format!(
-                                "[Tabel '{}'] 📦 Chunk {} dialirkan (~{} baris)...",
+                                "[Tabel '{}'] Tahap pengiriman selesai: ~{} row dikirim; menunggu verifikasi importer.",
                                 table_name,
-                                chunk_num,
-                                format_number(row_count)
+                                format_number(total_rows_synced)
                             ),
                         );
                     }
-                }
-                PipelineMsg::TableFinished { table_name, table_index, total_rows_synced } => {
-                    completed_tables += 1;
-                    emit_log(
-                        &app_consumer,
-                        "success",
-                        format!(
-                            "[Tabel '{}'] ✅ Selesai: total ~{} row berhasil disalin.",
-                            table_name,
-                            format_number(total_rows_synced)
-                        ),
-                    );
                     emit_progress(
                         &app_consumer,
                         table_index,
@@ -506,13 +828,72 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         }
 
         let postlude = "\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\n";
-        let _ = local_stdin.write_all(postlude.as_bytes()).await;
-        let _ = local_stdin.flush().await;
+        if !is_cancelled() {
+            if let Err(e) = local_stdin.write_all(postlude.as_bytes()).await {
+                fatal_failure_c.store(true, Ordering::SeqCst);
+                record_failure(
+                    &app_consumer,
+                    &failures_c,
+                    None,
+                    "Menutup sesi MySQL lokal",
+                    e.to_string(),
+                );
+            } else if let Err(e) = local_stdin.flush().await {
+                fatal_failure_c.store(true, Ordering::SeqCst);
+                record_failure(
+                    &app_consumer,
+                    &failures_c,
+                    None,
+                    "Flush akhir MySQL lokal",
+                    e.to_string(),
+                );
+            }
+        }
         drop(local_stdin);
 
-        let _ = local_child.wait().await;
-        if let Some(pid) = local_child.id() {
+        let status = match local_child.wait().await {
+            Ok(status) => status,
+            Err(e) => {
+                if let Some(pid) = local_pid {
+                    unregister_child_pid(pid);
+                }
+                fatal_failure_c.store(true, Ordering::SeqCst);
+                return Err(format!("Gagal menunggu proses MySQL lokal: {}", e));
+            }
+        };
+        if let Some(pid) = local_pid {
             unregister_child_pid(pid);
+        }
+        let stderr_output = stderr_task
+            .await
+            .map_err(|e| format!("Gagal mengambil keluaran error MySQL lokal: {}", e))?
+            .map_err(|e| format!("Gagal membaca STDERR MySQL lokal: {}", e))?;
+
+        if !is_cancelled() && !status.success() {
+            let message = if stderr_output.is_empty() {
+                format!("Proses MySQL lokal berhenti dengan status {}", status)
+            } else {
+                stderr_output
+            };
+            if touched_tables.is_empty() {
+                record_failure(
+                    &app_consumer,
+                    &failures_c,
+                    None,
+                    "Importer MySQL lokal",
+                    message,
+                );
+            } else {
+                for table_name in touched_tables {
+                    record_failure(
+                        &app_consumer,
+                        &failures_c,
+                        Some(&table_name),
+                        "Importer MySQL lokal",
+                        message.clone(),
+                    );
+                }
+            }
         }
 
         Ok((completed_tables, total_rows_imported))
@@ -531,6 +912,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let watermarks_c = incremental_watermarks.clone();
         let remote_cfg_c = remote_db_cfg.clone();
         let app_c = app.clone();
+        let failures_p = failures.clone();
         let tx_c = tx.clone();
         let row_limit_opt = sync_options.row_limit;
 
@@ -554,7 +936,13 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 let safe_table = match sanitize_identifier(table_name) {
                     Ok(s) => s,
                     Err(e) => {
-                        emit_log(&app_c, "error", format!("Nama tabel tidak valid '{}': {}", table_name, e));
+                        record_failure(
+                            &app_c,
+                            &failures_p,
+                            Some(table_name),
+                            "Memvalidasi nama tabel",
+                            e,
+                        );
                         continue;
                     }
                 };
@@ -564,34 +952,82 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                     emit_log(
                         &app_c,
                         "info",
-                        format!("[{}/{}] 🏗️ [Worker {}] Mengambil DDL tabel '{}'...", idx + 1, total_tables, worker_id + 1, table_name),
+                        format!(
+                            "[{}/{}] 🏗️ [Worker {}] Mengambil DDL tabel '{}'...",
+                            idx + 1,
+                            total_tables,
+                            worker_id + 1,
+                            table_name
+                        ),
                     );
 
                     let q = format!("SHOW CREATE TABLE {}", safe_table);
-                    if let Ok(row) = sqlx::query(&q).fetch_one(&*pool_c).await {
-                        let ddl: String = row.try_get(1).unwrap_or_default();
-                        if !ddl.is_empty() {
-                            let ddl_sql = if is_fresh {
-                                format!(
+                    match sqlx::query(&q).fetch_one(&*pool_c).await {
+                        Ok(row) => {
+                            let ddl: String = match row.try_get(1) {
+                                Ok(ddl) => ddl,
+                                Err(e) => {
+                                    record_failure(
+                                        &app_c,
+                                        &failures_p,
+                                        Some(table_name),
+                                        "Membaca struktur tabel remote",
+                                        e.to_string(),
+                                    );
+                                    String::new()
+                                }
+                            };
+                            if !ddl.is_empty() {
+                                let ddl_sql = if is_fresh {
+                                    format!(
                                     "SET FOREIGN_KEY_CHECKS=0;\nDROP TABLE IF EXISTS {};\n{};\nSET FOREIGN_KEY_CHECKS=1;\n",
                                     safe_table, ddl
                                 )
-                            } else {
-                                let safe_create = if !ddl.to_uppercase().contains("CREATE TABLE IF NOT EXISTS") {
-                                    ddl.replacen("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1)
                                 } else {
-                                    ddl
-                                };
-                                format!(
+                                    let safe_create = if !ddl
+                                        .to_uppercase()
+                                        .contains("CREATE TABLE IF NOT EXISTS")
+                                    {
+                                        ddl.replacen(
+                                            "CREATE TABLE",
+                                            "CREATE TABLE IF NOT EXISTS",
+                                            1,
+                                        )
+                                    } else {
+                                        ddl
+                                    };
+                                    format!(
                                     "SET FOREIGN_KEY_CHECKS=0;\n{};\nSET FOREIGN_KEY_CHECKS=1;\n",
                                     safe_create
                                 )
-                            };
-                            let _ = tx_c.send(PipelineMsg::Ddl {
-                                table_name: table_name.clone(),
-                                table_index: idx + 1,
-                                sql: ddl_sql,
-                            }).await;
+                                };
+                                if tx_c
+                                    .send(PipelineMsg::Ddl {
+                                        table_name: table_name.clone(),
+                                        table_index: idx + 1,
+                                        sql: ddl_sql,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    record_failure(
+                                        &app_c,
+                                        &failures_p,
+                                        Some(table_name),
+                                        "Mengirim struktur ke worker MySQL lokal",
+                                        "Worker impor lokal sudah berhenti",
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            record_failure(
+                                &app_c,
+                                &failures_p,
+                                Some(table_name),
+                                "Mengambil struktur tabel remote",
+                                e.to_string(),
+                            );
                         }
                     }
                 }
@@ -600,20 +1036,26 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 if table_item.sync_data {
                     let pk_col_opt = pk_map_c.get(table_name).cloned();
                     let watermark = if !is_fresh {
-                        watermarks_c.as_ref().as_ref().and_then(|w| w.get(table_name))
+                        watermarks_c
+                            .as_ref()
+                            .as_ref()
+                            .and_then(|w| w.get(table_name))
                     } else {
                         None
                     };
 
                     let start_id = match watermark {
-                        Some(wm) if wm.last_id > 0 && !wm.primary_key.trim().is_empty() => wm.last_id,
+                        Some(wm) if wm.last_id > 0 && !wm.primary_key.trim().is_empty() => {
+                            wm.last_id
+                        }
                         _ => 0,
                     };
 
                     let mut total_table_rows = 0usize;
 
                     if let Some(ref pk_col) = pk_col_opt {
-                        let safe_pk = sanitize_identifier(pk_col).unwrap_or_else(|_| format!("`{}`", pk_col));
+                        let safe_pk =
+                            sanitize_identifier(pk_col).unwrap_or_else(|_| format!("`{}`", pk_col));
                         let mut current_last_id = start_id;
                         let mut chunk_num = 1;
 
@@ -666,19 +1108,52 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 safe_pk, safe_table, safe_pk, current_last_id, safe_pk, this_chunk_limit
                             );
 
-                            let max_pk_in_chunk: Option<i64> = match sqlx::query(&bound_q).fetch_one(&*pool_c).await {
-                                Ok(row) => {
-                                    if let Ok(val) = row.try_get::<i64, _>(0) {
-                                        Some(val)
-                                    } else if let Ok(val) = row.try_get::<u64, _>(0) {
-                                        Some(val as i64)
-                                    } else if let Ok(val) = row.try_get::<i32, _>(0) {
-                                        Some(val as i64)
-                                    } else {
-                                        None
-                                    }
+                            let max_pk_in_chunk: Option<i64> = match sqlx::query(&bound_q)
+                                .fetch_one(&*pool_c)
+                                .await
+                            {
+                                Ok(row) => match row.try_get::<Option<i64>, _>(0) {
+                                    Ok(value) => value,
+                                    Err(signed_error) => match row.try_get::<Option<u64>, _>(0) {
+                                        Ok(Some(value)) => match i64::try_from(value) {
+                                            Ok(value) => Some(value),
+                                            Err(_) => {
+                                                record_failure(
+                                                    &app_c,
+                                                    &failures_p,
+                                                    Some(table_name),
+                                                    "Mencari batas data tabel",
+                                                    "Nilai primary key melebihi rentang integer yang didukung",
+                                                );
+                                                break;
+                                            }
+                                        },
+                                        Ok(None) => None,
+                                        Err(unsigned_error) => {
+                                            record_failure(
+                                                &app_c,
+                                                &failures_p,
+                                                Some(table_name),
+                                                "Membaca batas primary key",
+                                                format!(
+                                                    "Tipe primary key tidak didukung: {}; {}",
+                                                    signed_error, unsigned_error
+                                                ),
+                                            );
+                                            break;
+                                        }
+                                    },
+                                },
+                                Err(e) => {
+                                    record_failure(
+                                        &app_c,
+                                        &failures_p,
+                                        Some(table_name),
+                                        "Mencari batas chunk data remote",
+                                        e.to_string(),
+                                    );
+                                    break;
                                 }
-                                Err(_) => None,
                             };
 
                             let chunk_max = match max_pk_in_chunk {
@@ -689,7 +1164,10 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             let where_clause = if current_last_id == 0 {
                                 format!("--where={} <= {}", safe_pk, chunk_max)
                             } else {
-                                format!("--where={} > {} AND {} <= {}", safe_pk, current_last_id, safe_pk, chunk_max)
+                                format!(
+                                    "--where={} > {} AND {} <= {}",
+                                    safe_pk, current_last_id, safe_pk, chunk_max
+                                )
                             };
 
                             match dump_table_chunk_to_bytes(
@@ -698,18 +1176,31 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 table_name,
                                 &where_clause,
                                 !is_fresh,
-                            ).await {
+                            )
+                            .await
+                            {
                                 Ok((bytes, rows_in_chunk)) => {
-                                    let effective_rows = if rows_in_chunk == 0 { this_chunk_limit } else { rows_in_chunk };
-                                    total_table_rows += effective_rows;
-
-                                    let _ = tx_c.send(PipelineMsg::DataChunk {
-                                        table_name: table_name.clone(),
-                                        table_index: idx + 1,
-                                        chunk_num,
-                                        sql_bytes: bytes,
-                                        row_count: effective_rows,
-                                    }).await;
+                                    total_table_rows += rows_in_chunk;
+                                    if tx_c
+                                        .send(PipelineMsg::DataChunk {
+                                            table_name: table_name.clone(),
+                                            table_index: idx + 1,
+                                            chunk_num,
+                                            sql_bytes: bytes,
+                                            row_count: rows_in_chunk,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        record_failure(
+                                            &app_c,
+                                            &failures_p,
+                                            Some(table_name),
+                                            "Mengirim data ke worker MySQL lokal",
+                                            "Worker impor lokal sudah berhenti",
+                                        );
+                                        break;
+                                    }
 
                                     current_last_id = chunk_max;
                                     chunk_num += 1;
@@ -719,7 +1210,15 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                     }
                                 }
                                 Err(e) => {
-                                    emit_log(&app_c, "error", format!("[Tabel '{}'] Gagal dump chunk {}: {}", table_name, chunk_num, e));
+                                    if !is_cancelled() {
+                                        record_failure(
+                                            &app_c,
+                                            &failures_p,
+                                            Some(table_name),
+                                            &format!("Dump chunk {}", chunk_num),
+                                            e,
+                                        );
+                                    }
                                     break;
                                 }
                             }
@@ -736,34 +1235,82 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             table_name,
                             &where_clause,
                             !is_fresh,
-                        ).await {
+                        )
+                        .await
+                        {
                             Ok((bytes, rows_in_chunk)) => {
                                 total_table_rows += rows_in_chunk;
-                                let _ = tx_c.send(PipelineMsg::DataChunk {
-                                    table_name: table_name.clone(),
-                                    table_index: idx + 1,
-                                    chunk_num: 1,
-                                    sql_bytes: bytes,
-                                    row_count: rows_in_chunk,
-                                }).await;
+                                if tx_c
+                                    .send(PipelineMsg::DataChunk {
+                                        table_name: table_name.clone(),
+                                        table_index: idx + 1,
+                                        chunk_num: 1,
+                                        sql_bytes: bytes,
+                                        row_count: rows_in_chunk,
+                                    })
+                                    .await
+                                    .is_err()
+                                {
+                                    record_failure(
+                                        &app_c,
+                                        &failures_p,
+                                        Some(table_name),
+                                        "Mengirim data ke worker MySQL lokal",
+                                        "Worker impor lokal sudah berhenti",
+                                    );
+                                }
                             }
                             Err(e) => {
-                                emit_log(&app_c, "error", format!("[Tabel '{}'] Gagal dump: {}", table_name, e));
+                                if !is_cancelled() {
+                                    record_failure(
+                                        &app_c,
+                                        &failures_p,
+                                        Some(table_name),
+                                        "Dump data tabel",
+                                        e,
+                                    );
+                                }
                             }
                         }
                     }
 
-                    let _ = tx_c.send(PipelineMsg::TableFinished {
-                        table_name: table_name.clone(),
-                        table_index: idx + 1,
-                        total_rows_synced: total_table_rows,
-                    }).await;
+                    if tx_c
+                        .send(PipelineMsg::TableFinished {
+                            table_name: table_name.clone(),
+                            table_index: idx + 1,
+                            total_rows_synced: total_table_rows,
+                        })
+                        .await
+                        .is_err()
+                        && !is_cancelled()
+                    {
+                        record_failure(
+                            &app_c,
+                            &failures_p,
+                            Some(table_name),
+                            "Menyelesaikan tabel",
+                            "Worker impor lokal sudah berhenti",
+                        );
+                    }
                 } else {
-                    let _ = tx_c.send(PipelineMsg::TableFinished {
-                        table_name: table_name.clone(),
-                        table_index: idx + 1,
-                        total_rows_synced: 0,
-                    }).await;
+                    if tx_c
+                        .send(PipelineMsg::TableFinished {
+                            table_name: table_name.clone(),
+                            table_index: idx + 1,
+                            total_rows_synced: 0,
+                        })
+                        .await
+                        .is_err()
+                        && !is_cancelled()
+                    {
+                        record_failure(
+                            &app_c,
+                            &failures_p,
+                            Some(table_name),
+                            "Menyelesaikan tabel",
+                            "Worker impor lokal sudah berhenti",
+                        );
+                    }
                 }
             }
         });
@@ -775,13 +1322,30 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
     // Wait for all download workers to finish
     for h in download_handles {
-        let _ = h.await;
+        if let Err(e) = h.await {
+            record_failure(
+                &app,
+                &failures,
+                None,
+                "Worker download remote",
+                e.to_string(),
+            );
+        }
     }
 
     // Wait for local consumer worker to finish writing all queued data
     let (completed_table_count, total_rows_all_tables) = match consumer_handle.await {
         Ok(Ok(res)) => res,
-        _ => (0, 0),
+        Ok(Err(e)) => {
+            fatal_failure.store(true, Ordering::SeqCst);
+            record_failure(&app, &failures, None, "Worker impor lokal", e);
+            (0, 0)
+        }
+        Err(e) => {
+            fatal_failure.store(true, Ordering::SeqCst);
+            record_failure(&app, &failures, None, "Worker impor lokal", e.to_string());
+            (0, 0)
+        }
     };
 
     let _ = remote_pool.close().await;
@@ -789,44 +1353,120 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
     let duration = start_time.elapsed();
     let was_cancelled = is_cancelled();
+    if !was_cancelled && completed_table_count != total_tables {
+        record_failure(
+            &app,
+            &failures,
+            None,
+            "Sinkronisasi",
+            "Proses berhenti sebelum seluruh tabel selesai",
+        );
+    }
+    let failures = failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let failure_count = failures.len();
+    let all_tables_processed = completed_table_count == total_tables;
+    let status = resolve_sync_status(
+        was_cancelled,
+        fatal_failure.load(Ordering::SeqCst),
+        all_tables_processed,
+        !failures.is_empty(),
+    );
 
     let result = SyncResult {
-        success: !was_cancelled,
+        success: status == "success",
+        status: status.to_string(),
         total_tables: completed_table_count,
         total_rows_synced: total_rows_all_tables,
         duration_ms: duration.as_millis() as u64,
-        error: if was_cancelled {
-            Some("Dibatalkan oleh pengguna".to_string())
-        } else {
-            None
+        error: match status {
+            "success" => None,
+            "partial" => Some(format!(
+                "Sinkronisasi selesai dengan {} masalah",
+                failure_count
+            )),
+            "cancelled" => Some("Dibatalkan oleh pengguna".to_string()),
+            _ => Some("Sinkronisasi berhenti sebelum semua tabel selesai".to_string()),
         },
+        failures,
     };
 
     let _ = app.emit("sync-finished", &result);
 
-    if was_cancelled {
-        emit_log(
-            &app,
-            "warning",
-            format!(
-                "⚠️ Sinkronisasi dibatalkan. {} tabel diproses, {} row disalin ({:.1}s).",
-                completed_table_count,
-                format_number(total_rows_all_tables),
-                duration.as_secs_f64()
-            ),
-        );
-    } else {
-        emit_log(
-            &app,
+    let (log_type, summary) = match status {
+        "success" => (
             "success",
             format!(
-                "🎉 Pipeline Sync Berhasil! {} tabel diproses, total {} row disalin dalam {:.1} detik.",
+                "🎉 Sinkronisasi berhasil: {} tabel diproses, total {} row dikirim dalam {:.1} detik.",
                 completed_table_count,
                 format_number(total_rows_all_tables),
                 duration.as_secs_f64()
             ),
-        );
-    }
+        ),
+        "partial" => (
+            "warning",
+            format!(
+                "⚠️ Sinkronisasi selesai sebagian: {} dari {} tabel diproses; {} masalah ditemukan dalam {:.1} detik.",
+                completed_table_count,
+                total_tables,
+                failure_count,
+                duration.as_secs_f64()
+            ),
+        ),
+        "cancelled" => (
+            "warning",
+            format!(
+                "⏹ Sinkronisasi dibatalkan: {} dari {} tabel diproses, {} row dikirim ({:.1}s).",
+                completed_table_count,
+                total_tables,
+                format_number(total_rows_all_tables),
+                duration.as_secs_f64()
+            ),
+        ),
+        _ => (
+            "error",
+            format!(
+                "❌ Sinkronisasi gagal sebelum semua tabel selesai: {} dari {} tabel diproses; {} masalah ditemukan ({:.1}s).",
+                completed_table_count,
+                total_tables,
+                failure_count,
+                duration.as_secs_f64()
+            ),
+        ),
+    };
+    emit_log(&app, log_type, summary);
 
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_sync_status;
+
+    #[test]
+    fn sync_status_is_success_only_when_everything_finishes_cleanly() {
+        assert_eq!(resolve_sync_status(false, false, true, false), "success");
+    }
+
+    #[test]
+    fn sync_status_is_partial_when_all_tables_finish_with_table_errors() {
+        assert_eq!(resolve_sync_status(false, false, true, true), "partial");
+    }
+
+    #[test]
+    fn sync_status_is_failed_when_pipeline_stops_before_all_tables() {
+        assert_eq!(resolve_sync_status(false, false, false, true), "failed");
+    }
+
+    #[test]
+    fn sync_status_is_failed_for_a_fatal_importer_error() {
+        assert_eq!(resolve_sync_status(false, true, true, true), "failed");
+    }
+
+    #[test]
+    fn sync_status_keeps_cancellation_distinct_from_failure() {
+        assert_eq!(resolve_sync_status(true, true, false, true), "cancelled");
+    }
 }

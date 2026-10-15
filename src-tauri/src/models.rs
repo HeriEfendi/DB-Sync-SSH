@@ -78,6 +78,8 @@ pub struct LogPayload {
     pub r#type: String, // "info" | "success" | "warning" | "error"
     pub message: String,
     pub timestamp: String,
+    pub details: Option<String>,
+    pub table_name: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -93,8 +95,17 @@ pub struct ProgressPayload {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SyncResult {
     pub success: bool,
+    pub status: String,
     pub total_tables: usize,
     pub total_rows_synced: usize,
     pub duration_ms: u64,
     pub error: Option<String>,
+    pub failures: Vec<SyncFailure>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct SyncFailure {
+    pub table_name: Option<String>,
+    pub stage: String,
+    pub message: String,
 }

@@ -3,7 +3,7 @@
     <div class="modal-content">
       <div class="modal-header">
         <h2 class="modal-title">
-          {{ isFinished ? 'Sinkronisasi Selesai' : `Syncing ${profileName}...` }}
+          {{ isFinished ? resultTitle : `Syncing ${profileName}...` }}
         </h2>
         <button class="btn-secondary" style="padding: 0.25rem 0.5rem;" @click="$emit('minimize')">
           ✕
@@ -11,6 +11,14 @@
       </div>
 
       <div class="modal-body">
+        <div
+          v-if="isFinished && result"
+          class="sync-result-banner"
+          :class="`sync-result-${result.status || 'failed'}`"
+        >
+          {{ resultMessage }}
+        </div>
+
         <!-- Progress Bar -->
         <div class="progress-container">
           <div class="progress-header">
@@ -47,8 +55,24 @@
                 'log-msg-error': log.type === 'error'
               }"
             >
-              {{ log.message }}
+              <button
+                v-if="log.details"
+                type="button"
+                class="log-detail-toggle"
+                :class="{
+                  'log-msg-info': log.type === 'info',
+                  'log-msg-success': log.type === 'success',
+                  'log-msg-warning': log.type === 'warning' || log.type === 'warn',
+                  'log-msg-error': log.type === 'error'
+                }"
+                :aria-expanded="expandedLogs.has(idx)"
+                @click="toggleLog(idx)"
+              >
+                {{ log.message }} {{ expandedLogs.has(idx) ? '▾' : '▸' }}
+              </button>
+              <span v-else>{{ log.message }}</span>
             </span>
+            <pre v-if="log.details && expandedLogs.has(idx)" class="log-detail-content">{{ log.details }}</pre>
           </div>
           <div v-if="logs.length === 0" style="color: #64748b; font-style: italic;">
             Menunggu log dari engine sinkronisasi...
@@ -61,9 +85,10 @@
           v-if="!isFinished"
           type="button"
           class="btn-danger"
+          :disabled="isCancelling"
           @click="$emit('stop-sync')"
         >
-          Stop Sync
+          {{ isCancelling ? 'Membatalkan...' : 'Stop Sync' }}
         </button>
         <button
           v-else
@@ -101,6 +126,14 @@ const props = defineProps({
     type: Array,
     default: () => [],
   },
+  result: {
+    type: Object,
+    default: null,
+  },
+  isCancelling: {
+    type: Boolean,
+    default: false,
+  },
   isFinished: {
     type: Boolean,
     default: false,
@@ -110,6 +143,29 @@ const props = defineProps({
 defineEmits(['stop-sync', 'minimize', 'close']);
 
 const terminalRef = ref(null);
+const expandedLogs = ref(new Set());
+
+const resultTitle = computed(() => {
+  switch (props.result?.status) {
+    case 'success': return 'Sinkronisasi Berhasil';
+    case 'partial': return 'Sinkronisasi Sebagian';
+    case 'cancelled': return 'Sinkronisasi Dibatalkan';
+    default: return 'Sinkronisasi Gagal';
+  }
+});
+
+const resultMessage = computed(() => {
+  if (props.result?.error) return props.result.error;
+  if (props.result?.status === 'success') return 'Semua tabel berhasil diproses.';
+  return 'Sinkronisasi tidak selesai sepenuhnya.';
+});
+
+function toggleLog(index) {
+  const updated = new Set(expandedLogs.value);
+  if (updated.has(index)) updated.delete(index);
+  else updated.add(index);
+  expandedLogs.value = updated;
+}
 
 const percentComplete = computed(() => {
   if (!props.progress.total_tables) return 0;

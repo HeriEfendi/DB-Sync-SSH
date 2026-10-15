@@ -53,6 +53,8 @@
       :progress="syncProgress"
       :logs="syncLogs"
       :is-finished="!isSyncing"
+      :result="syncResult"
+      :is-cancelling="isCancelling"
       @stop-sync="handleStopSync"
       @minimize="showSyncModal = false"
       @close="showSyncModal = false"
@@ -97,6 +99,8 @@ const isLoadingTables = ref(false);
 const isSyncing = ref(false);
 const showSyncModal = ref(false);
 const syncLogs = ref([]);
+const syncResult = ref(null);
+const isCancelling = ref(false);
 const syncProgress = ref({
   current_table_index: 0,
   total_tables: 0,
@@ -240,7 +244,7 @@ async function setupEventListeners() {
     const unLog = await safeListen('sync-log', (event) => {
       const payload = event.payload;
       if (payload) {
-        syncLogs.value.push(payload);
+        appendSyncLog(payload);
       }
     });
     unlisteners.push(unLog);
@@ -253,32 +257,6 @@ async function setupEventListeners() {
     });
     unlisteners.push(unProgress);
 
-    const unFinished = await safeListen('sync-finished', async (event) => {
-      const result = event.payload;
-      isSyncing.value = false;
-
-      // Add to history
-      if (result) {
-        const durationSec = Math.round((result.duration_ms || 0) / 1000);
-        const mins = Math.floor(durationSec / 60);
-        const secs = durationSec % 60;
-        const durText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
-
-        const newEntry = {
-          profile_name: activeProfile.value?.name || 'database',
-          status: result.success ? 'Completed' : 'Aborted',
-          tables_count: result.total_tables || 0,
-          rows_copied: result.total_rows_synced || 0,
-          duration_text: durText,
-        };
-        historyList.value = addHistoryEntry(newEntry);
-
-        if (result.success && activeProfile.value) {
-          await detectAndSyncLocalIds();
-        }
-      }
-    });
-    unlisteners.push(unFinished);
   } catch (e) {
     console.warn('Failed to register listeners:', e);
   }
@@ -290,6 +268,9 @@ async function handleStartSync(syncOptions) {
   isSyncing.value = true;
   showSyncModal.value = true;
   syncLogs.value = [];
+  syncResult.value = null;
+  const syncingProfile = activeProfile.value;
+  const selectedTables = syncOptions.tables.map((table) => table.name);
   syncProgress.value = {
     current_table_index: 0,
     total_tables: syncOptions.tables.length,
@@ -301,9 +282,9 @@ async function handleStartSync(syncOptions) {
 
   try {
     const res = await safeInvoke('start_ssh_sync', {
-      sshConfig: activeProfile.value.ssh,
-      remoteDbConfig: activeProfile.value.remote_db,
-      localDbConfig: activeProfile.value.local_db,
+      sshConfig: syncingProfile.ssh,
+      remoteDbConfig: syncingProfile.remote_db,
+      localDbConfig: syncingProfile.local_db,
       syncOptions: {
         tables: syncOptions.tables,
         row_limit: syncOptions.row_limit,
@@ -314,47 +295,102 @@ async function handleStartSync(syncOptions) {
     });
 
     if (res) {
+      const status = res.status || (res.success ? 'success' : 'failed');
+      syncResult.value = { ...res, status };
+      syncProgress.value = { ...syncProgress.value, status };
+      for (const failure of res.failures || []) {
+        const tablePrefix = failure.table_name ? `[Tabel '${failure.table_name}'] ` : '';
+        appendSyncLog({
+          type: 'error',
+          table_name: failure.table_name,
+          message: `${tablePrefix}${failure.stage} gagal`,
+          details: failure.message,
+          timestamp: new Date().toLocaleTimeString(),
+        });
+      }
       const durationSec = Math.round((res.duration_ms || 0) / 1000);
       const mins = Math.floor(durationSec / 60);
       const secs = durationSec % 60;
       const durText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
       const newEntry = {
-        profile_name: activeProfile.value?.name || 'database',
-        status: res.success ? 'Completed' : 'Aborted',
+        profile_name: syncingProfile.name || 'database',
+        status: historyStatus(status),
         tables_count: res.total_tables || 0,
         rows_copied: res.total_rows_synced || 0,
         duration_text: durText,
       };
       historyList.value = addHistoryEntry(newEntry);
 
-      if (res.success && activeProfile.value) {
+      if (status === 'success') {
         const nowIso = new Date().toISOString();
-        for (const tbl of syncOptions.tables) {
-          saveTableState(activeProfile.value.id, tbl.name, {
+        for (const tableName of selectedTables) {
+          saveTableState(syncingProfile.id, tableName, {
             lastSyncTime: nowIso,
           });
         }
-        await detectAndSyncLocalIds(syncOptions.tables.map((t) => t.name));
+        if (activeProfileId.value === syncingProfile.id) {
+          await detectAndSyncLocalIds(selectedTables);
+        }
       }
     }
   } catch (err) {
     console.error('Sinkronisasi error:', err);
-    syncLogs.value.push({
+    syncResult.value = {
+      status: 'failed',
+      success: false,
+      error: String(err),
+    };
+    syncProgress.value = { ...syncProgress.value, status: 'failed' };
+    appendSyncLog({
       type: 'error',
       message: `Error: ${err}`,
       timestamp: new Date().toLocaleTimeString(),
+      details: String(err),
+    });
+    historyList.value = addHistoryEntry({
+      profile_name: syncingProfile.name || 'database',
+      status: 'Failed',
+      tables_count: 0,
+      rows_copied: 0,
+      duration_text: '—',
     });
   } finally {
     isSyncing.value = false;
+    isCancelling.value = false;
   }
 }
 
+function appendSyncLog(log) {
+  if (
+    log.details &&
+    syncLogs.value.some(
+      (existing) =>
+        existing.message === log.message &&
+        existing.table_name === log.table_name &&
+        existing.details === log.details
+    )
+  ) {
+    return;
+  }
+  syncLogs.value.push(log);
+}
+
+function historyStatus(status) {
+  if (status === 'success') return 'Completed';
+  if (status === 'partial') return 'Partial';
+  if (status === 'cancelled') return 'Cancelled';
+  return 'Failed';
+}
+
 async function handleStopSync() {
+  if (isCancelling.value) return;
+  isCancelling.value = true;
   try {
     await safeInvoke('cancel_ssh_sync');
   } catch (err) {
     console.warn('Gagal membatalkan sinkronisasi:', err);
+    isCancelling.value = false;
   }
 }
 

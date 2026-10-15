@@ -129,7 +129,14 @@ pub async fn ensure_local_database_exists(config: &LocalDbConfig) -> Result<(), 
 
 pub fn spawn_mysql_child(
     local_config: &LocalDbConfig,
-) -> Result<(tokio::process::Child, tokio::process::ChildStdin, tokio::process::ChildStderr), String> {
+) -> Result<
+    (
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::process::ChildStderr,
+    ),
+    String,
+> {
     let use_docker = local_config.use_docker && !local_config.docker_container.trim().is_empty();
     let container_name = local_config.docker_container.trim();
 
@@ -158,7 +165,11 @@ pub fn spawn_mysql_child(
         } else {
             local_config.host.trim()
         };
-        let port = if local_config.port == 0 { 3306 } else { local_config.port };
+        let port = if local_config.port == 0 {
+            3306
+        } else {
+            local_config.port
+        };
 
         // Check if mariadb or mysql cli binary is available
         let binary = if std::path::Path::new("/usr/bin/mariadb").exists() {
@@ -189,7 +200,7 @@ pub fn spawn_mysql_child(
     };
 
     cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
+        .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
     let mut child = cmd
@@ -255,7 +266,10 @@ pub async fn get_all_tables_last_local_ids(
         WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI'
         ORDER BY ORDINAL_POSITION ASC
     ";
-    let pk_rows = sqlx::query(pk_query).fetch_all(&pool).await.unwrap_or_default();
+    let pk_rows = sqlx::query(pk_query)
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default();
 
     use std::collections::HashMap;
     let mut pk_map: HashMap<String, String> = HashMap::new();

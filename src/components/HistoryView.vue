@@ -43,12 +43,14 @@
                   class="status-badge"
                   :class="{
                     completed: item.status === 'Completed',
+                    partial: item.status === 'Partial',
                     aborted: item.status === 'Aborted',
+                    cancelled: item.status === 'Cancelled',
                     failed: item.status === 'Failed',
                   }"
                 >
                   <CheckCircle2 v-if="item.status === 'Completed'" :size="12" />
-                  <AlertTriangle v-else-if="item.status === 'Aborted'" :size="12" />
+                  <AlertTriangle v-else-if="['Aborted', 'Partial', 'Cancelled'].includes(item.status)" :size="12" />
                   <XCircle v-else :size="12" />
                   <span>{{ item.status }}</span>
                 </span>
