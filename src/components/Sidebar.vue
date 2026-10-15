@@ -5,7 +5,7 @@
         <div class="sidebar-brand-group">
           <Database class="sidebar-brand-icon" :size="16" />
           <span class="sidebar-brand-title">DB Sync Engine</span>
-          <span class="sidebar-version-badge">v1.1.2</span>
+          <span class="sidebar-version-badge">v{{ appVersion }}</span>
         </div>
       </div>
 
@@ -108,7 +108,10 @@
 
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue';
+import { getVersion } from '@tauri-apps/api/app';
 import { Database, Plus, History, MoreVertical, Pencil, Trash2, AlertTriangle } from 'lucide-vue-next';
+
+const appVersion = ref('...');
 
 defineProps({
   profiles: {
@@ -192,7 +195,8 @@ function onKeyDown(e) {
   }
 }
 
-onMounted(() => {
+onMounted(async () => {
+  appVersion.value = await getVersion();
   window.addEventListener('click', onWindowClick);
   window.addEventListener('keydown', onKeyDown);
 });
