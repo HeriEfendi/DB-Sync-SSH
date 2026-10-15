@@ -150,7 +150,7 @@ GitHub Actions membangun installer Linux (`.deb`, `.rpm`, `.pkg.tar.zst` untuk A
 npm run release -- 1.2.3
 ```
 
-Perintah tersebut menyamakan versi di manifest frontend dan Tauri/Rust, membuat commit serta tag release, lalu mendorong branch dan tag ke remote `origin`. Workflow akan membuat GitHub Release dan mengunggah paket hasil build. Versi harus dinaikkan sebelum membuat release berikutnya.
+Perintah tersebut menyamakan versi di manifest frontend dan Tauri/Rust, membuat commit serta tag release, lalu mendorong branch dan tag ke remote `origin`. Workflow akan membuat GitHub Release dan mengunggah paket hasil build. Versi harus dinaikkan sebelum membuat release berikutnya. Untuk mengulang build pada tag yang sudah ada tanpa memindahkan tag, jalankan workflow **Release Desktop Apps** secara manual dari branch terbaru dan isi input `tag` (misalnya `v0.1.1`).
 
 ---
 
