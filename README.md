@@ -142,6 +142,16 @@ npm run tauri build
 Paket installer dan binary executable akan dihasilkan di folder:
 `src-tauri/target/release/bundle/` (`.deb`, `.rpm`, `.AppImage`, atau `.exe`/`.dmg`).
 
+### Release Otomatis via GitHub Actions
+
+GitHub Actions membangun installer Linux (`.deb`, `.rpm`, `.pkg.tar.zst` untuk Arch Linux), Windows (`.msi`, `.exe`), dan macOS (`.dmg`) saat tag versi `vX.Y.Z` didorong ke GitHub. Untuk membuat release, pastikan seluruh perubahan sudah di-commit dan branch aktif sudah siap dirilis, lalu jalankan:
+
+```bash
+npm run release -- 1.2.3
+```
+
+Perintah tersebut menyamakan versi di manifest frontend dan Tauri/Rust, membuat commit serta tag release, lalu mendorong branch dan tag ke remote `origin`. Workflow akan membuat GitHub Release dan mengunggah paket hasil build. Versi harus dinaikkan sebelum membuat release berikutnya.
+
 ---
 
 ## 📝 Format Konfigurasi Profil
