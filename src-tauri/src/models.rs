@@ -124,6 +124,7 @@ pub struct LogPayload {
 pub struct ProgressPayload {
     pub current_table_index: usize,
     pub total_tables: usize,
+    pub completed_tables: usize,
     pub current_table_name: String,
     pub rows_synced_current_table: usize,
     pub total_synced_all_tables: usize,

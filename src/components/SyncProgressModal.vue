@@ -116,6 +116,7 @@ const props = defineProps({
     default: () => ({
       current_table_index: 0,
       total_tables: 0,
+      completed_tables: 0,
       current_table_name: '',
       rows_synced_current_table: 0,
       total_synced_all_tables: 0,
@@ -184,7 +185,7 @@ function isLogExpanded(log, index) {
 
 const percentComplete = computed(() => {
   if (!props.progress.total_tables) return 0;
-  const p = Math.round((props.progress.current_table_index / props.progress.total_tables) * 100);
+  const p = Math.round((props.progress.completed_tables / props.progress.total_tables) * 100);
   return Math.min(100, Math.max(0, p));
 });
 

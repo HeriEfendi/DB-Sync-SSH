@@ -104,6 +104,7 @@ const isCancelling = ref(false);
 const syncProgress = ref({
   current_table_index: 0,
   total_tables: 0,
+  completed_tables: 0,
   current_table_name: '',
   rows_synced_current_table: 0,
   total_synced_all_tables: 0,
@@ -281,6 +282,7 @@ async function handleStartSync(syncOptions) {
   syncProgress.value = {
     current_table_index: 0,
     total_tables: syncOptions.tables.length,
+    completed_tables: 0,
     current_table_name: syncOptions.tables[0]?.name || '',
     rows_synced_current_table: 0,
     total_synced_all_tables: 0,
