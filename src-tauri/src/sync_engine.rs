@@ -589,7 +589,6 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             incremental_primary_key(columns).map(|column| (table.clone(), column))
         })
         .collect();
-    let pk_map = Arc::new(pk_map);
 
     let updated_at_query = "
         SELECT TABLE_NAME
@@ -604,6 +603,11 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         .iter()
         .filter_map(|row| row.try_get::<String, _>("TABLE_NAME").ok())
         .collect();
+    let pk_map: HashMap<String, String> = pk_map
+        .into_iter()
+        .filter(|(table, _)| tables_with_updated_at.contains(table))
+        .collect();
+    let pk_map = Arc::new(pk_map);
     let tables_with_updated_at = Arc::new(tables_with_updated_at);
 
     let sync_timestamp: String =
@@ -1128,7 +1132,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 &app_c,
                                 "warning",
                                 format!(
-                                    "[Tabel '{}'] Kolom updated_at atau waktu watermark tidak tersedia; incremental memakai full upsert untuk menangkap perubahan baris lama.",
+                                    "[Tabel '{}'] Kolom updated_at tersedia, tetapi waktu watermark sebelumnya belum ada atau formatnya tidak dikenali; memakai full upsert agar perubahan baris lama tetap tertangkap.",
                                     table_name
                                 ),
                             );
@@ -1341,7 +1345,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             &app_c,
                             "warning",
                             format!(
-                                "[Tabel '{}'] Primary key bukan satu kolom integer bertanda; memakai full upsert agar PK teks/komposit tidak melewatkan baris.",
+                                "[Tabel '{}'] Mode incremental perlu satu primary key kolom id bertipe integer dan kolom updated_at; memakai full upsert.",
                                 table_name
                             ),
                         );

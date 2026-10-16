@@ -1,18 +1,19 @@
 use serde::{Deserialize, Serialize};
 
-pub fn supports_incremental_integer_primary_key(data_type: &str, column_type: &str) -> bool {
+pub fn supports_incremental_integer_primary_key(data_type: &str) -> bool {
     matches!(
         data_type.to_ascii_lowercase().as_str(),
         "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint"
-    ) && !column_type.to_ascii_lowercase().contains("unsigned")
+    )
 }
 
 pub fn incremental_primary_key(columns: &[(String, String, String)]) -> Option<String> {
     if columns.len() != 1 {
         return None;
     }
-    let (column, data_type, column_type) = &columns[0];
-    supports_incremental_integer_primary_key(data_type, column_type).then(|| column.clone())
+    let (column, data_type, _) = &columns[0];
+    (column.eq_ignore_ascii_case("id") && supports_incremental_integer_primary_key(data_type))
+        .then(|| column.clone())
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -133,22 +134,21 @@ mod tests {
     use super::incremental_primary_key;
 
     #[test]
-    fn incremental_keyset_accepts_one_signed_integer_primary_key() {
-        let columns = vec![("id".to_string(), "bigint".to_string(), "bigint".to_string())];
+    fn incremental_keyset_accepts_one_integer_id_primary_key() {
+        let columns = vec![(
+            "id".to_string(),
+            "bigint".to_string(),
+            "bigint unsigned".to_string(),
+        )];
         assert_eq!(incremental_primary_key(&columns).as_deref(), Some("id"));
     }
 
     #[test]
-    fn incremental_keyset_rejects_text_unsigned_and_composite_primary_keys() {
+    fn incremental_keyset_rejects_text_non_id_and_composite_primary_keys() {
         let text_key = vec![(
             "id".to_string(),
             "varchar".to_string(),
             "varchar(36)".to_string(),
-        )];
-        let unsigned_key = vec![(
-            "id".to_string(),
-            "bigint".to_string(),
-            "bigint unsigned".to_string(),
         )];
         let composite_key = vec![
             (
@@ -162,8 +162,13 @@ mod tests {
                 "int".to_string(),
             ),
         ];
+        let non_id_key = vec![(
+            "record_id".to_string(),
+            "int".to_string(),
+            "int".to_string(),
+        )];
         assert_eq!(incremental_primary_key(&text_key), None);
-        assert_eq!(incremental_primary_key(&unsigned_key), None);
         assert_eq!(incremental_primary_key(&composite_key), None);
+        assert_eq!(incremental_primary_key(&non_id_key), None);
     }
 }
