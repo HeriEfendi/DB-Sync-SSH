@@ -1,4 +1,7 @@
-use crate::local_db::{ensure_local_database_exists, sanitize_identifier, spawn_mysql_child};
+use crate::local_db::{
+    build_local_connection_string, ensure_local_database_exists, sanitize_identifier,
+    spawn_mysql_child,
+};
 use crate::models::{
     incremental_primary_key, LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig,
     SyncFailure, SyncOptions, SyncResult, TableInfo,
@@ -144,6 +147,63 @@ fn normalize_mysql_timestamp(value: &str) -> Option<String> {
     chrono::NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f")
         .ok()
         .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S%.f").to_string())
+}
+
+fn normalize_create_table_ddl(ddl: &str) -> String {
+    let tokens: Vec<&str> = ddl.split_whitespace().collect();
+    let mut normalized = Vec::with_capacity(tokens.len());
+    let mut index = 0;
+
+    while index < tokens.len() {
+        let token = tokens[index];
+        let upper = token.to_ascii_uppercase();
+        if upper.starts_with("AUTO_INCREMENT=") {
+            index += 1;
+            continue;
+        }
+        if upper == "AUTO_INCREMENT" {
+            index += 1;
+            if tokens.get(index) == Some(&"=") {
+                index += 1;
+            }
+            if index < tokens.len() {
+                index += 1;
+            }
+            continue;
+        }
+        normalized.push(token);
+        index += 1;
+    }
+
+    normalized.join(" ")
+}
+
+async fn get_table_create_ddl(
+    pool: &sqlx::MySqlPool,
+    table_name: &str,
+) -> Result<Option<String>, String> {
+    let exists: Option<String> = sqlx::query_scalar(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND TABLE_TYPE = 'BASE TABLE'",
+    )
+    .bind(table_name)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Gagal memeriksa tabel lokal '{}': {}", table_name, e))?;
+
+    if exists.is_none() {
+        return Ok(None);
+    }
+
+    let safe_table = sanitize_identifier(table_name)?;
+    let query = format!("SHOW CREATE TABLE {}", safe_table);
+    let row = sqlx::query(&query)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("Gagal membaca skema tabel lokal '{}': {}", table_name, e))?;
+    let ddl: String = row
+        .try_get(1)
+        .map_err(|e| format!("Gagal membaca DDL tabel lokal '{}': {}", table_name, e))?;
+    Ok(Some(ddl))
 }
 
 fn build_chunk_where_clause(
@@ -357,6 +417,11 @@ pub enum PipelineMsg {
         table_index: usize,
         total_rows_synced: usize,
     },
+    TableSkipped {
+        table_name: String,
+        table_index: usize,
+        reason: String,
+    },
 }
 
 async fn dump_table_chunk_to_bytes(
@@ -558,6 +623,30 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             return Err(e.to_string());
         }
     };
+
+    let estimate_rows = sqlx::query(
+        "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) AS estimated_rows FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'",
+    )
+    .fetch_all(&*remote_pool)
+    .await
+    .map_err(|e| format!("Gagal membaca estimasi jumlah baris remote: {}", e))?;
+    let estimated_row_counts: HashMap<String, u64> = estimate_rows
+        .iter()
+        .filter_map(|row| {
+            let table_name = row.try_get::<String, _>("TABLE_NAME").ok()?;
+            let row_count = row.try_get::<i64, _>("estimated_rows").ok()?.max(0) as u64;
+            Some((table_name, row_count))
+        })
+        .collect();
+    let estimated_row_counts = Arc::new(estimated_row_counts);
+
+    let local_connection_string = build_local_connection_string(&local_db_config);
+    let local_schema_pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(8))
+        .connect(&local_connection_string)
+        .await
+        .map_err(|e| format!("Gagal terhubung untuk memeriksa skema MySQL lokal: {}", e))?;
 
     // Pre-query primary keys and update timestamp columns in batch queries.
     let pk_query = "
@@ -886,6 +975,27 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         "completed",
                     );
                 }
+                PipelineMsg::TableSkipped {
+                    table_name,
+                    table_index,
+                    reason,
+                } => {
+                    completed_tables += 1;
+                    emit_log(
+                        &app_consumer,
+                        "info",
+                        format!("[Tabel '{}'] Dilewati: {}", table_name, reason),
+                    );
+                    emit_progress(
+                        &app_consumer,
+                        table_index,
+                        total_tables_c,
+                        &table_name,
+                        0,
+                        total_rows_imported,
+                        "skipped",
+                    );
+                }
             }
         }
 
@@ -977,6 +1087,8 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let app_c = app.clone();
         let failures_p = failures.clone();
         let tx_c = tx.clone();
+        let estimated_row_counts_c = estimated_row_counts.clone();
+        let local_schema_pool_c = local_schema_pool.clone();
         let row_limit_opt = sync_options.row_limit;
 
         let handle = tokio::spawn(async move {
@@ -996,6 +1108,27 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 };
 
                 let table_name = &table_item.name;
+                if estimated_row_counts_c.get(table_name) == Some(&0) {
+                    if tx_c
+                        .send(PipelineMsg::TableSkipped {
+                            table_name: table_name.clone(),
+                            table_index: idx + 1,
+                            reason: "TABLE_ROWS memperkirakan 0 baris".to_string(),
+                        })
+                        .await
+                        .is_err()
+                    {
+                        record_failure(
+                            &app_c,
+                            &failures_p,
+                            Some(table_name),
+                            "Melewati tabel kosong",
+                            "Worker impor lokal sudah berhenti",
+                        );
+                    }
+                    continue;
+                }
+
                 let safe_table = match sanitize_identifier(table_name) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1009,6 +1142,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         continue;
                     }
                 };
+                let mut table_is_fresh = is_fresh;
 
                 // A. Structure DDL
                 if table_item.sync_structure {
@@ -1041,7 +1175,50 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 }
                             };
                             if !ddl.is_empty() {
-                                let ddl_sql = if is_fresh {
+                                if !is_fresh {
+                                    match get_table_create_ddl(&local_schema_pool_c, table_name)
+                                        .await
+                                    {
+                                        Ok(local_ddl) => {
+                                            let schema_changed =
+                                                local_ddl.as_deref().is_none_or(|local| {
+                                                    normalize_create_table_ddl(local)
+                                                        != normalize_create_table_ddl(&ddl)
+                                                });
+                                            if schema_changed {
+                                                table_is_fresh = true;
+                                                emit_log(
+                                                    &app_c,
+                                                    "warning",
+                                                    format!(
+                                                        "[Tabel '{}'] Skema lokal berbeda dari remote; tabel ini diproses sebagai fresh sync dengan batas baris UI.",
+                                                        table_name
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            record_failure(
+                                                &app_c,
+                                                &failures_p,
+                                                Some(table_name),
+                                                "Membandingkan skema tabel lokal dan remote",
+                                                e,
+                                            );
+                                            let _ = tx_c
+                                                .send(PipelineMsg::TableSkipped {
+                                                    table_name: table_name.clone(),
+                                                    table_index: idx + 1,
+                                                    reason: "skema lokal tidak dapat diverifikasi"
+                                                        .to_string(),
+                                                })
+                                                .await;
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                let ddl_sql = if table_is_fresh {
                                     format!(
                                     "SET FOREIGN_KEY_CHECKS=0;\nDROP TABLE IF EXISTS {};\n{};\nSET FOREIGN_KEY_CHECKS=1;\n",
                                     safe_table, ddl
@@ -1098,7 +1275,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 // B. Data Sync (with Chunking for large tables)
                 if table_item.sync_data {
                     let pk_col_opt = pk_map_c.get(table_name).cloned();
-                    let watermark = if !is_fresh {
+                    let watermark = if !table_is_fresh {
                         watermarks_c
                             .as_ref()
                             .as_ref()
@@ -1300,7 +1477,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 &remote_cfg_c,
                                 table_name,
                                 &where_clause,
-                                !is_fresh,
+                                !table_is_fresh,
                             )
                             .await
                             {
@@ -1366,7 +1543,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             &remote_cfg_c,
                             table_name,
                             &where_clause,
-                            !is_fresh,
+                            !table_is_fresh,
                         )
                         .await
                         {
