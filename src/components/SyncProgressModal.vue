@@ -65,14 +65,14 @@
                   'log-msg-warning': log.type === 'warning' || log.type === 'warn',
                   'log-msg-error': log.type === 'error'
                 }"
-                :aria-expanded="expandedLogs.has(idx)"
+                :aria-expanded="isLogExpanded(log, idx)"
                 @click="toggleLog(idx)"
               >
-                {{ log.message }} {{ expandedLogs.has(idx) ? '▾' : '▸' }}
+                {{ log.message }} {{ isLogExpanded(log, idx) ? '▾' : '▸' }}
               </button>
               <span v-else>{{ log.message }}</span>
             </span>
-            <pre v-if="log.details && expandedLogs.has(idx)" class="log-detail-content">{{ log.details }}</pre>
+            <pre v-if="log.details && isLogExpanded(log, idx)" class="log-detail-content">{{ log.details }}</pre>
           </div>
           <div v-if="logs.length === 0" style="color: #64748b; font-style: italic;">
             Menunggu log dari engine sinkronisasi...
@@ -144,6 +144,7 @@ defineEmits(['stop-sync', 'minimize', 'close']);
 
 const terminalRef = ref(null);
 const expandedLogs = ref(new Set());
+const collapsedLogs = ref(new Set());
 
 const resultTitle = computed(() => {
   switch (props.result?.status) {
@@ -161,10 +162,24 @@ const resultMessage = computed(() => {
 });
 
 function toggleLog(index) {
-  const updated = new Set(expandedLogs.value);
-  if (updated.has(index)) updated.delete(index);
-  else updated.add(index);
-  expandedLogs.value = updated;
+  const log = props.logs[index];
+  const updated = new Set(log?.type === 'error' ? collapsedLogs.value : expandedLogs.value);
+  const currentlyExpanded = isLogExpanded(log, index);
+
+  if (log?.type === 'error') {
+    if (currentlyExpanded) updated.add(index);
+    else updated.delete(index);
+    collapsedLogs.value = updated;
+  } else {
+    if (currentlyExpanded) updated.delete(index);
+    else updated.add(index);
+    expandedLogs.value = updated;
+  }
+}
+
+function isLogExpanded(log, index) {
+  if (log?.type === 'error') return !collapsedLogs.value.has(index);
+  return expandedLogs.value.has(index);
 }
 
 const percentComplete = computed(() => {

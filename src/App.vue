@@ -121,27 +121,34 @@ function refreshLocalTableStates() {
 }
 
 async function detectAndSyncLocalIds(tableList = null) {
-  if (!activeProfile.value?.local_db) return;
+  const profile = activeProfile.value;
+  if (!profile?.local_db) return;
+  const profileId = profile.id;
   try {
     const targetNames = tableList || tables.value.map((t) => t.name);
     if (!targetNames || targetNames.length === 0) return;
 
     const localInfos = await safeInvoke('get_all_tables_last_local_ids', {
-      config: activeProfile.value.local_db,
+      config: profile.local_db,
       tables: targetNames,
     });
 
     if (Array.isArray(localInfos)) {
+      // Read the latest persisted values so local-ID detection cannot overwrite
+      // a newer lastSyncTime with a stale value from the Vue state cache.
+      const latestStates = getAllTableStates(profileId);
       for (const info of localInfos) {
-        const existing = tableStatesMap.value[info.table_name] || {};
+        const existing = latestStates[info.table_name] || {};
         const updated = {
           ...existing,
           primaryKey: info.primary_key,
-          lastSyncedId: info.max_id,
+          lastSyncedId: info.max_id_str ?? info.max_id,
         };
-        saveTableState(activeProfile.value.id, info.table_name, updated);
+        saveTableState(profileId, info.table_name, updated);
       }
-      refreshLocalTableStates();
+      if (activeProfileId.value === profileId) {
+        refreshLocalTableStates();
+      }
     }
   } catch (err) {
     console.warn('Gagal mendeteksi last local IDs:', err);
