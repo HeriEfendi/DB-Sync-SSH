@@ -450,15 +450,9 @@ pub async fn get_all_tables_last_local_ids(
             let safe_t = sanitize_identifier(&table);
             let safe_c = sanitize_identifier(pk);
             if let (Ok(st), Ok(sc)) = (safe_t, safe_c) {
-                let q = format!("SELECT MAX({}) FROM {}", sc, st);
+                let q = format!("SELECT CAST(MAX({}) AS CHAR) FROM {}", sc, st);
                 if let Ok(row) = sqlx::query(&q).fetch_one(&pool).await {
-                    if let Ok(val) = row.try_get::<i64, _>(0) {
-                        max_id = Some(val);
-                        max_id_str = Some(val.to_string());
-                    } else if let Ok(val) = row.try_get::<u64, _>(0) {
-                        max_id = i64::try_from(val).ok();
-                        max_id_str = Some(val.to_string());
-                    } else if let Ok(val) = row.try_get::<String, _>(0) {
+                    if let Ok(Some(val)) = row.try_get::<Option<String>, _>(0) {
                         max_id = val.parse::<i64>().ok();
                         max_id_str = Some(val);
                     }

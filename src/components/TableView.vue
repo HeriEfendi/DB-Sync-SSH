@@ -425,11 +425,7 @@ function formatNumber(n) {
 
 function formatLastId(id) {
   if (id === null || id === undefined || id === '') return '-';
-  const num = Number(id);
-  if (!isNaN(num)) {
-    return formatNumber(num);
-  }
-  return String(id);
+  return String(id).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
 }
 
 function formatDisplayTime(timeStr) {
@@ -471,10 +467,13 @@ function startSync() {
 
       // Pass both row ID and the remote timestamp from the previous successful sync.
       const st = props.tableStatesMap[tblName];
-      if (st && st.lastSyncedId !== undefined && st.lastSyncedId !== null && Number(st.lastSyncedId) > 0) {
+      const lastId = st?.lastSyncedId === undefined || st?.lastSyncedId === null
+        ? ''
+        : String(st.lastSyncedId).trim();
+      if (/^[0-9]+$/.test(lastId) && /[1-9]/.test(lastId)) {
         watermarks[tblName] = {
           primary_key: st.primaryKey || 'id',
-          last_id: Number(st.lastSyncedId) || 0,
+          last_id: lastId,
           last_sync_time: st.lastSyncTime || null,
         };
       }

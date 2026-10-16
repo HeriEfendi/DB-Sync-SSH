@@ -148,9 +148,9 @@ fn normalize_mysql_timestamp(value: &str) -> Option<String> {
 
 fn build_chunk_where_clause(
     safe_pk: &str,
-    current_last_id: Option<i64>,
-    chunk_max: i64,
-    update_filter: Option<(i64, &str, &str)>,
+    current_last_id: Option<i128>,
+    chunk_max: i128,
+    update_filter: Option<(i128, &str, &str)>,
 ) -> String {
     let range_condition = match current_last_id {
         Some(last_id) => format!("{} > {} AND {} <= {}", safe_pk, last_id, safe_pk, chunk_max),
@@ -1111,8 +1111,10 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
                     if let Some(ref pk_col) = pk_col_opt {
                         let watermark_id = watermark.and_then(|wm| {
-                            (wm.last_id > 0 && wm.primary_key.eq_ignore_ascii_case(pk_col.as_str()))
-                                .then_some(wm.last_id)
+                            (wm.primary_key.eq_ignore_ascii_case(pk_col.as_str()))
+                                .then(|| wm.last_id.parse::<i128>().ok())
+                                .flatten()
+                                .filter(|id| *id > 0)
                         });
                         let safe_pk =
                             sanitize_identifier(pk_col).unwrap_or_else(|_| format!("`{}`", pk_col));
@@ -1169,7 +1171,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                     total_tables,
                                     worker_id + 1,
                                     table_name,
-                                    format_number(start_id as usize),
+                                    start_id,
                                     pk_col
                                 ),
                             );
@@ -1207,49 +1209,55 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 .map(|last_id| format!("{} > {}", safe_pk, last_id))
                                 .unwrap_or_else(|| "1=1".to_string());
                             let bound_q = format!(
-                                "SELECT MAX(t.pk), COUNT(*) FROM (SELECT {} AS pk FROM {} WHERE {} ORDER BY {} ASC LIMIT {}) AS t",
+                                "SELECT CAST(MAX(t.pk) AS CHAR), COUNT(*) FROM (SELECT {} AS pk FROM {} WHERE {} ORDER BY {} ASC LIMIT {}) AS t",
                                 safe_pk, safe_table, bound_condition, safe_pk, this_chunk_limit
                             );
 
-                            let (max_pk_in_chunk, keys_in_chunk): (Option<i64>, u64) =
+                            let (max_pk_in_chunk, keys_in_chunk): (Option<i128>, u64) =
                                 match sqlx::query(&bound_q).fetch_one(&*pool_c).await {
                                     Ok(row) => {
-                                        let max_pk = match row.try_get::<Option<i64>, _>(0) {
-                                            Ok(value) => value,
-                                            Err(signed_error) => {
-                                                match row.try_get::<Option<u64>, _>(0) {
-                                                    Ok(Some(value)) => match i64::try_from(value) {
-                                                        Ok(value) => Some(value),
-                                                        Err(_) => {
-                                                            record_failure(
+                                        let max_pk = match row.try_get::<Option<String>, _>(0) {
+                                            Ok(Some(value)) => match value.parse::<i128>() {
+                                                Ok(value) => Some(value),
+                                                Err(e) => {
+                                                    record_failure(
                                                         &app_c,
                                                         &failures_p,
                                                         Some(table_name),
-                                                        "Mencari batas data tabel",
-                                                        "Nilai primary key melebihi rentang integer yang didukung",
+                                                        "Membaca batas primary key",
+                                                        format!("Nilai primary key tidak valid '{}': {}", value, e),
                                                     );
-                                                            break;
-                                                        }
-                                                    },
-                                                    Ok(None) => None,
-                                                    Err(unsigned_error) => {
+                                                    break;
+                                                }
+                                            },
+                                            Ok(None) => None,
+                                            Err(e) => {
+                                                record_failure(
+                                                    &app_c,
+                                                    &failures_p,
+                                                    Some(table_name),
+                                                    "Membaca batas primary key",
+                                                    e.to_string(),
+                                                );
+                                                break;
+                                            }
+                                        };
+                                        let key_count = match row.try_get::<i64, _>(1) {
+                                            Ok(value) => {
+                                                match u64::try_from(value) {
+                                                    Ok(value) => value,
+                                                    Err(e) => {
                                                         record_failure(
-                                                            &app_c,
-                                                            &failures_p,
-                                                            Some(table_name),
-                                                            "Membaca batas primary key",
-                                                            format!(
-                                                        "Tipe primary key tidak didukung: {}; {}",
-                                                        signed_error, unsigned_error
-                                                    ),
-                                                        );
+                                                        &app_c,
+                                                        &failures_p,
+                                                        Some(table_name),
+                                                        "Membaca jumlah baris chunk",
+                                                        format!("Jumlah baris chunk tidak valid: {}", e),
+                                                    );
                                                         break;
                                                     }
                                                 }
                                             }
-                                        };
-                                        let key_count = match row.try_get::<u64, _>(1) {
-                                            Ok(value) => value,
                                             Err(e) => {
                                                 record_failure(
                                                     &app_c,

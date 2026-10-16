@@ -67,9 +67,29 @@ pub struct TableSyncItem {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WatermarkItem {
     pub primary_key: String,
-    pub last_id: i64,
+    #[serde(deserialize_with = "deserialize_integer_string")]
+    pub last_id: String,
     #[serde(default)]
     pub last_sync_time: Option<String>,
+}
+
+fn deserialize_integer_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntegerValue {
+        Signed(i64),
+        Unsigned(u64),
+        Text(String),
+    }
+
+    match IntegerValue::deserialize(deserializer)? {
+        IntegerValue::Signed(value) => Ok(value.to_string()),
+        IntegerValue::Unsigned(value) => Ok(value.to_string()),
+        IntegerValue::Text(value) => Ok(value),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
