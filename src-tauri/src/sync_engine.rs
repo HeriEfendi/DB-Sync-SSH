@@ -407,12 +407,11 @@ pub enum PipelineMsg {
         table_index: usize,
         sql: String,
     },
-    DataChunk {
+    DataChunkStream {
         table_name: String,
         table_index: usize,
         chunk_num: usize,
-        sql_bytes: Vec<u8>,
-        row_count: usize,
+        stream: tokio::sync::mpsc::Receiver<DumpStreamItem>,
     },
     TableFinished {
         table_name: String,
@@ -426,13 +425,20 @@ pub enum PipelineMsg {
     },
 }
 
-async fn dump_table_chunk_to_bytes(
+#[derive(Debug)]
+pub enum DumpStreamItem {
+    Bytes(Vec<u8>),
+    Finished(Result<usize, String>),
+}
+
+async fn dump_table_chunk_to_stream(
     tunnel_port: u16,
     remote_db_config: &RemoteDbConfig,
     table_name: &str,
     where_clause: &str,
     use_replace: bool,
-) -> Result<(Vec<u8>, usize), String> {
+    stream_tx: tokio::sync::mpsc::Sender<DumpStreamItem>,
+) -> Result<usize, String> {
     let mut dump_cmd = crate::process_utils::new_tokio_command("mysqldump");
     dump_cmd
         .arg("-h")
@@ -445,6 +451,7 @@ async fn dump_table_chunk_to_bytes(
         .arg("--skip-triggers")
         .arg("--quick")
         .arg("--single-transaction")
+        .arg("--compress")
         .arg("--net-buffer-length=1048576")
         .arg("--max-allowed-packet=1073741824")
         .arg("--default-character-set=utf8mb4");
@@ -476,7 +483,6 @@ async fn dump_table_chunk_to_bytes(
         register_child_pid(pid);
     }
 
-    let mut output_bytes = Vec::new();
     let mut rows_count = 0usize;
     let mut stderr = dump_child
         .stderr
@@ -515,7 +521,19 @@ async fn dump_table_chunk_to_bytes(
                             rows_count += line.matches("),(").count() + 1;
                         }
                     }
-                    output_bytes.extend_from_slice(chunk);
+                    if stream_tx
+                        .send(DumpStreamItem::Bytes(chunk.to_vec()))
+                        .await
+                        .is_err()
+                    {
+                        let _ = dump_child.kill().await;
+                        let _ = dump_child.wait().await;
+                        if let Some(pid) = dump_pid {
+                            unregister_child_pid(pid);
+                        }
+                        let _ = stderr_task.await;
+                        return Err("Importer lokal berhenti menerima stream dump".to_string());
+                    }
                 }
                 Err(e) => {
                     let _ = dump_child.kill().await;
@@ -556,7 +574,60 @@ async fn dump_table_chunk_to_bytes(
         return Err(message);
     }
 
-    Ok((output_bytes, rows_count))
+    Ok(rows_count)
+}
+
+async fn dispatch_dump_chunk(
+    tx: &tokio::sync::mpsc::Sender<PipelineMsg>,
+    tunnel_port: u16,
+    remote_db_config: &RemoteDbConfig,
+    table_name: &str,
+    table_index: usize,
+    chunk_num: usize,
+    where_clause: String,
+    use_replace: bool,
+) -> Result<usize, String> {
+    // Only two 64 KiB blocks can wait per stream; a slow local importer applies
+    // backpressure to mysqldump instead of allowing a whole chunk to accumulate.
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(2);
+    let dump_config = remote_db_config.clone();
+    let dump_table = table_name.to_string();
+    let finish_tx = stream_tx.clone();
+    let dump_task = tokio::spawn(async move {
+        let result = dump_table_chunk_to_stream(
+            tunnel_port,
+            &dump_config,
+            &dump_table,
+            &where_clause,
+            use_replace,
+            stream_tx,
+        )
+        .await;
+        let finished = match &result {
+            Ok(row_count) => Ok(*row_count),
+            Err(error) => Err(error.clone()),
+        };
+        let _ = finish_tx.send(DumpStreamItem::Finished(finished)).await;
+        result
+    });
+
+    if tx
+        .send(PipelineMsg::DataChunkStream {
+            table_name: table_name.to_string(),
+            table_index,
+            chunk_num,
+            stream: stream_rx,
+        })
+        .await
+        .is_err()
+    {
+        let _ = dump_task.await;
+        return Err("Worker impor lokal sudah berhenti".to_string());
+    }
+
+    dump_task
+        .await
+        .map_err(|e| format!("Worker mysqldump gagal: {}", e))?
 }
 
 pub async fn run_sync_task<R: tauri::Runtime>(
@@ -864,17 +935,19 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         }
                     }
                 }
-                PipelineMsg::DataChunk {
+                PipelineMsg::DataChunkStream {
                     table_name,
                     table_index,
                     chunk_num,
-                    sql_bytes,
-                    row_count,
+                    mut stream,
                 } => {
                     touched_tables.insert(table_name.clone());
-                    let mut chunk_written = if sql_bytes.is_empty() {
-                        true
-                    } else if stdin_failed {
+                    let mut chunk_written = !stdin_failed;
+                    let mut dump_succeeded = false;
+                    let mut wrote_bytes = false;
+                    let mut row_count = 0usize;
+
+                    if stdin_failed {
                         record_failure(
                             &app_consumer,
                             &failures_c,
@@ -885,48 +958,65 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 chunk_num
                             ),
                         );
-                        false
-                    } else if let Err(e) = local_stdin.write_all(&sql_bytes).await {
-                        stdin_failed = true;
-                        fatal_failure_c.store(true, Ordering::SeqCst);
-                        record_failure(
-                            &app_consumer,
-                            &failures_c,
-                            Some(&table_name),
-                            "Mengirim data ke MySQL lokal",
-                            format!("Chunk {}: {}", chunk_num, e),
-                        );
-                        false
-                    } else if let Err(e) = local_stdin.flush().await {
-                        stdin_failed = true;
-                        fatal_failure_c.store(true, Ordering::SeqCst);
-                        record_failure(
-                            &app_consumer,
-                            &failures_c,
-                            Some(&table_name),
-                            "Flush data ke MySQL lokal",
-                            format!("Chunk {}: {}", chunk_num, e),
-                        );
-                        false
-                    } else {
-                        true
-                    };
+                    }
 
-                    if chunk_written
-                        && !sql_bytes.is_empty()
-                        && !check_importer_running(
+                    while chunk_written {
+                        match stream.recv().await {
+                            Some(DumpStreamItem::Bytes(bytes)) => {
+                                wrote_bytes = true;
+                                if let Err(e) = local_stdin.write_all(&bytes).await {
+                                    stdin_failed = true;
+                                    fatal_failure_c.store(true, Ordering::SeqCst);
+                                    record_failure(
+                                        &app_consumer,
+                                        &failures_c,
+                                        Some(&table_name),
+                                        "Mengirim data ke MySQL lokal",
+                                        format!("Chunk {}: {}", chunk_num, e),
+                                    );
+                                    chunk_written = false;
+                                }
+                            }
+                            Some(DumpStreamItem::Finished(result)) => {
+                                match result {
+                                    Ok(rows) => {
+                                        row_count = rows;
+                                        dump_succeeded = true;
+                                    }
+                                    Err(_) => {}
+                                }
+                                break;
+                            }
+                            None => break,
+                        }
+                    }
+
+                    if chunk_written && dump_succeeded && wrote_bytes {
+                        if let Err(e) = local_stdin.flush().await {
+                            stdin_failed = true;
+                            fatal_failure_c.store(true, Ordering::SeqCst);
+                            record_failure(
+                                &app_consumer,
+                                &failures_c,
+                                Some(&table_name),
+                                "Flush data ke MySQL lokal",
+                                format!("Chunk {}: {}", chunk_num, e),
+                            );
+                            chunk_written = false;
+                        } else if !check_importer_running(
                             &mut local_child,
                             &app_consumer,
                             &failures_c,
                             &fatal_failure_c,
                             &table_name,
-                        )
-                    {
-                        stdin_failed = true;
-                        chunk_written = false;
+                        ) {
+                            stdin_failed = true;
+                            chunk_written = false;
+                        }
                     }
 
-                    if chunk_written {
+                    let chunk_succeeded = chunk_written && dump_succeeded;
+                    if chunk_succeeded {
                         total_rows_imported += row_count;
                         if row_count > 0 {
                             emit_log(
@@ -947,7 +1037,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         total_tables_c,
                         completed_tables,
                         &table_name,
-                        if chunk_written { row_count } else { 0 },
+                        if chunk_succeeded { row_count } else { 0 },
                         total_rows_imported,
                         "syncing",
                     );
@@ -1479,38 +1569,20 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 update_filter,
                             );
 
-                            match dump_table_chunk_to_bytes(
+                            match dispatch_dump_chunk(
+                                &tx_c,
                                 tunnel_port,
                                 &remote_cfg_c,
                                 table_name,
-                                &where_clause,
+                                idx + 1,
+                                chunk_num,
+                                where_clause,
                                 !table_is_fresh,
                             )
                             .await
                             {
-                                Ok((bytes, rows_in_chunk)) => {
+                                Ok(rows_in_chunk) => {
                                     total_table_rows += rows_in_chunk;
-                                    if tx_c
-                                        .send(PipelineMsg::DataChunk {
-                                            table_name: table_name.clone(),
-                                            table_index: idx + 1,
-                                            chunk_num,
-                                            sql_bytes: bytes,
-                                            row_count: rows_in_chunk,
-                                        })
-                                        .await
-                                        .is_err()
-                                    {
-                                        record_failure(
-                                            &app_c,
-                                            &failures_p,
-                                            Some(table_name),
-                                            "Mengirim data ke worker MySQL lokal",
-                                            "Worker impor lokal sudah berhenti",
-                                        );
-                                        break;
-                                    }
-
                                     current_last_id = Some(chunk_max);
                                     chunk_num += 1;
 
@@ -1545,36 +1617,20 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             Some(lim) if lim > 0 => format!("--where=1 LIMIT {}", lim),
                             _ => String::new(),
                         };
-                        match dump_table_chunk_to_bytes(
+                        match dispatch_dump_chunk(
+                            &tx_c,
                             tunnel_port,
                             &remote_cfg_c,
                             table_name,
-                            &where_clause,
+                            idx + 1,
+                            1,
+                            where_clause,
                             !table_is_fresh,
                         )
                         .await
                         {
-                            Ok((bytes, rows_in_chunk)) => {
+                            Ok(rows_in_chunk) => {
                                 total_table_rows += rows_in_chunk;
-                                if tx_c
-                                    .send(PipelineMsg::DataChunk {
-                                        table_name: table_name.clone(),
-                                        table_index: idx + 1,
-                                        chunk_num: 1,
-                                        sql_bytes: bytes,
-                                        row_count: rows_in_chunk,
-                                    })
-                                    .await
-                                    .is_err()
-                                {
-                                    record_failure(
-                                        &app_c,
-                                        &failures_p,
-                                        Some(table_name),
-                                        "Mengirim data ke worker MySQL lokal",
-                                        "Worker impor lokal sudah berhenti",
-                                    );
-                                }
                             }
                             Err(e) => {
                                 if !is_cancelled() {
