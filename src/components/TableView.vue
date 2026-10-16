@@ -197,9 +197,15 @@
                 <span
                   v-if="tableStatesMap[tbl.name]?.lastSyncTime"
                   class="last-time-text"
-                  :title="formatFullDate(tableStatesMap[tbl.name].lastSyncTime)"
+                  :title="formatFullDate(
+                    tableStatesMap[tbl.name].lastSyncTime,
+                    tableStatesMap[tbl.name].lastSyncTimeEpochMs
+                  )"
                 >
-                  {{ formatDisplayTime(tableStatesMap[tbl.name].lastSyncTime) }}
+                  {{ formatDisplayTime(
+                    tableStatesMap[tbl.name].lastSyncTime,
+                    tableStatesMap[tbl.name].lastSyncTimeEpochMs
+                  ) }}
                 </span>
                 <span v-else class="text-dim-sync">Belum sync</span>
               </td>
@@ -428,29 +434,49 @@ function formatLastId(id) {
   return String(id).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
 }
 
-function formatDisplayTime(timeStr) {
-  if (!timeStr) return '';
+function getSyncDate(timeStr, epochMs) {
+  if (epochMs !== undefined && epochMs !== null && Number.isFinite(Number(epochMs))) {
+    const date = new Date(Number(epochMs));
+    if (!isNaN(date.getTime())) return date;
+  }
+  if (!timeStr) return null;
   try {
-    const d = new Date(timeStr.includes(' ') ? timeStr.replace(' ', 'T').slice(0, 23) : timeStr);
-    if (isNaN(d.getTime())) return '';
-    const day = String(d.getDate()).padStart(2, '0');
-    const mon = String(d.getMonth() + 1).padStart(2, '0');
-    const hr = String(d.getHours()).padStart(2, '0');
-    const min = String(d.getMinutes()).padStart(2, '0');
-    return `${day}/${mon} ${hr}:${min}`;
+    const date = new Date(timeStr.includes(' ') ? timeStr.replace(' ', 'T').slice(0, 23) : timeStr);
+    return isNaN(date.getTime()) ? null : date;
   } catch {
-    return '';
+    return null;
   }
 }
 
-function formatFullDate(timeStr) {
-  if (!timeStr) return '';
-  try {
-    const d = new Date(timeStr.includes(' ') ? timeStr.replace(' ', 'T').slice(0, 23) : timeStr);
-    return isNaN(d.getTime()) ? '' : d.toLocaleString('id-ID');
-  } catch {
-    return '';
-  }
+function formatDisplayTime(timeStr, epochMs) {
+  const date = getSyncDate(timeStr, epochMs);
+  if (!date) return '';
+  const parts = new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    day: '2-digit',
+    month: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const part = (type) => parts.find((item) => item.type === type)?.value || '';
+  return `${part('day')}/${part('month')} ${part('hour')}:${part('minute')}`;
+}
+
+function formatFullDate(timeStr, epochMs) {
+  const date = getSyncDate(timeStr, epochMs);
+  if (!date) return '';
+  return new Intl.DateTimeFormat('id-ID', {
+    timeZone: 'Asia/Jakarta',
+    year: 'numeric',
+    month: 'long',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hourCycle: 'h23',
+    timeZoneName: 'short',
+  }).format(date);
 }
 
 function startSync() {

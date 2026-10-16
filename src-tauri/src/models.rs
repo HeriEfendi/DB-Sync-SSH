@@ -139,6 +139,7 @@ pub struct SyncResult {
     pub total_rows_synced: usize,
     pub duration_ms: u64,
     pub sync_timestamp: Option<String>,
+    pub sync_timestamp_epoch_ms: Option<i64>,
     pub error: Option<String>,
     pub failures: Vec<SyncFailure>,
 }

@@ -701,11 +701,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let pk_map = Arc::new(pk_map);
     let tables_with_updated_at = Arc::new(tables_with_updated_at);
 
-    let sync_timestamp: String =
-        sqlx::query_scalar("SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f')")
-            .fetch_one(&*remote_pool)
-            .await
-            .map_err(|e| format!("Gagal membaca waktu server MySQL remote: {}", e))?;
+    let (sync_timestamp, sync_timestamp_epoch_ms): (String, i64) = sqlx::query_as(
+        "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f'), CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) * 1000 AS SIGNED)",
+    )
+    .fetch_one(&*remote_pool)
+    .await
+    .map_err(|e| format!("Gagal membaca waktu server MySQL remote: {}", e))?;
 
     let total_tables = sync_options.tables.len();
     let sync_mode = sync_options.sync_mode.as_deref().unwrap_or("incremental");
@@ -1118,7 +1119,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         .send(PipelineMsg::TableSkipped {
                             table_name: table_name.clone(),
                             table_index: idx + 1,
-                            reason: "TABLE_ROWS memperkirakan 0 baris".to_string(),
+                            reason: "estimasi TABLE_ROWS 0".to_string(),
                         })
                         .await
                         .is_err()
@@ -1127,7 +1128,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             &app_c,
                             &failures_p,
                             Some(table_name),
-                            "Melewati tabel kosong",
+                            "Melewati tabel dengan estimasi 0",
                             "Worker impor lokal sudah berhenti",
                         );
                     }
@@ -1147,6 +1148,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         continue;
                     }
                 };
+
                 let mut table_is_fresh = is_fresh;
 
                 // A. Structure DDL
@@ -1663,6 +1665,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     };
 
     let _ = remote_pool.close().await;
+    local_schema_pool.close().await;
     drop(tunnel);
 
     let duration = start_time.elapsed();
@@ -1696,6 +1699,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         total_rows_synced: total_rows_all_tables,
         duration_ms: duration.as_millis() as u64,
         sync_timestamp: Some(sync_timestamp),
+        sync_timestamp_epoch_ms: Some(sync_timestamp_epoch_ms),
         error: match status {
             "success" => None,
             "partial" => Some(format!(
