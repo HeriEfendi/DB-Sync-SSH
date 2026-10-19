@@ -331,22 +331,33 @@ async function handleStartSync(syncOptions) {
       };
       historyList.value = addHistoryEntry(newEntry);
 
-      if (status === 'success') {
-        const now = Date.now();
-        const lastSyncTime = res.sync_timestamp || new Date(now).toISOString();
-        const returnedEpoch = Number(res.sync_timestamp_epoch_ms);
-        const lastSyncTimeEpochMs =
-          res.sync_timestamp_epoch_ms != null && Number.isFinite(returnedEpoch)
-            ? returnedEpoch
-            : now;
-        for (const tableName of selectedTables) {
-          saveTableState(syncingProfile.id, tableName, {
-            lastSyncTime,
-            lastSyncTimeEpochMs,
-          });
-        }
-        if (activeProfileId.value === syncingProfile.id) {
-          await detectAndSyncLocalIds(selectedTables);
+      if (status === 'success' || status === 'partial') {
+        const failedTableNames = new Set(
+          (res.failures || [])
+            .map((f) => f.table_name)
+            .filter(Boolean)
+        );
+        const successfulTables = selectedTables.filter(
+          (t) => !failedTableNames.has(t)
+        );
+
+        if (successfulTables.length > 0) {
+          const now = Date.now();
+          const lastSyncTime = res.sync_timestamp || new Date(now).toISOString();
+          const returnedEpoch = Number(res.sync_timestamp_epoch_ms);
+          const lastSyncTimeEpochMs =
+            res.sync_timestamp_epoch_ms != null && Number.isFinite(returnedEpoch)
+              ? returnedEpoch
+              : now;
+          for (const tableName of successfulTables) {
+            saveTableState(syncingProfile.id, tableName, {
+              lastSyncTime,
+              lastSyncTimeEpochMs,
+            });
+          }
+          if (activeProfileId.value === syncingProfile.id) {
+            await detectAndSyncLocalIds(successfulTables);
+          }
         }
       }
     }

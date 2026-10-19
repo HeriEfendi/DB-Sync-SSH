@@ -179,7 +179,22 @@ pub async fn test_local_connection(config: &LocalDbConfig) -> Result<String, Str
             .nth(1)
             .unwrap_or("Docker MySQL Connected")
             .trim();
-        return Ok(format!("Docker [{}] ({}): {}", container, cli, version));
+
+        let conn_str = build_local_connection_string(config);
+        let tcp_status = match MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect(&conn_str)
+            .await
+        {
+            Ok(p) => {
+                p.close().await;
+                " [TCP OK]"
+            }
+            Err(_) => " (Catatan: Port TCP lokal belum terhubung ke host. Pastikan port MySQL di-forward ke host jika sinkronisasi membaca skema/ID)",
+        };
+
+        return Ok(format!("Docker [{}] ({}): {}{}", container, cli, version, tcp_status));
     }
 
     let conn_str = build_local_connection_string(config);

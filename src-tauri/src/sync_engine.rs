@@ -150,34 +150,45 @@ fn normalize_mysql_timestamp(value: &str) -> Option<String> {
 }
 
 fn normalize_create_table_ddl(ddl: &str) -> String {
-    let tokens: Vec<&str> = ddl.split_whitespace().collect();
-    let mut normalized = Vec::with_capacity(tokens.len());
-    let mut index = 0;
+    // Extract column/index definition body between first '(' and last ')'
+    let body = match (ddl.find('('), ddl.rfind(')')) {
+        (Some(start), Some(end)) if start < end => &ddl[start + 1..end],
+        _ => ddl,
+    };
 
-    while index < tokens.len() {
-        let token = tokens[index];
-        let upper = token.to_ascii_uppercase();
-        if upper.starts_with("AUTO_INCREMENT=") {
-            index += 1;
-            continue;
+    let mut clean_body = String::with_capacity(body.len());
+    for c in body.chars() {
+        if c != '`' {
+            clean_body.push(c.to_ascii_lowercase());
         }
-        if upper == "AUTO_INCREMENT" {
-            index += 1;
-            if tokens.get(index) == Some(&"=") {
-                index += 1;
-                if index < tokens.len() && tokens[index].chars().all(|c| c.is_ascii_digit()) {
-                    index += 1;
-                }
-            } else if index < tokens.len() && tokens[index].chars().all(|c| c.is_ascii_digit()) {
-                index += 1;
-            }
-            continue;
-        }
-        normalized.push(token);
-        index += 1;
     }
 
-    normalized.join(" ")
+    let tokens: Vec<&str> = clean_body.split_whitespace().collect();
+    let mut normalized_tokens = Vec::with_capacity(tokens.len());
+
+    for token in tokens {
+        // Strip integer display widths, e.g. int(11) -> int, bigint(20) -> bigint
+        let clean = if let Some(idx) = token.find('(') {
+            let prefix = &token[..idx];
+            if matches!(
+                prefix,
+                "int" | "tinyint" | "smallint" | "mediumint" | "bigint"
+            ) {
+                if token.ends_with(',') {
+                    format!("{},", prefix)
+                } else {
+                    prefix.to_string()
+                }
+            } else {
+                token.to_string()
+            }
+        } else {
+            token.to_string()
+        };
+        normalized_tokens.push(clean);
+    }
+
+    normalized_tokens.join(" ")
 }
 
 async fn get_table_create_ddl(
@@ -433,6 +444,37 @@ pub enum DumpStreamItem {
     Finished(Result<usize, String>),
 }
 
+fn count_row_delimiters(chunk: &[u8], carry: &mut Vec<u8>) -> usize {
+    let mut count = 0;
+    let carry_len = carry.len();
+    if carry_len > 0 {
+        let seam_len = chunk.len().min(8);
+        let mut seam = Vec::with_capacity(carry_len + seam_len);
+        seam.extend_from_slice(carry);
+        seam.extend_from_slice(&chunk[..seam_len]);
+
+        let seam_str = String::from_utf8_lossy(&seam);
+        for pat in &["VALUES (", "values (", "VALUES(", "values(", "),("] {
+            for (idx, _) in seam_str.match_indices(pat) {
+                if idx < carry_len && idx + pat.len() > carry_len {
+                    count += 1;
+                }
+            }
+        }
+    }
+
+    let chunk_str = String::from_utf8_lossy(chunk);
+    for pat in &["VALUES (", "values (", "VALUES(", "values(", "),("] {
+        count += chunk_str.match_indices(pat).count();
+    }
+
+    let tail_len = chunk.len().min(8);
+    carry.clear();
+    carry.extend_from_slice(&chunk[chunk.len() - tail_len..]);
+
+    count
+}
+
 async fn dump_table_chunk_to_stream(
     tunnel_port: u16,
     remote_db_config: &RemoteDbConfig,
@@ -486,6 +528,7 @@ async fn dump_table_chunk_to_stream(
     }
 
     let mut rows_count = 0usize;
+    let mut row_carry: Vec<u8> = Vec::new();
     let mut stderr = dump_child
         .stderr
         .take()
@@ -517,12 +560,7 @@ async fn dump_table_chunk_to_stream(
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = &buffer[..n];
-                    let chunk_str = String::from_utf8_lossy(chunk);
-                    for line in chunk_str.lines() {
-                        if line.starts_with("INSERT INTO") || line.starts_with("REPLACE INTO") {
-                            rows_count += line.matches("),(").count() + 1;
-                        }
-                    }
+                    rows_count += count_row_delimiters(chunk, &mut row_carry);
                     if stream_tx
                         .send(DumpStreamItem::Bytes(chunk.to_vec()))
                         .await
@@ -858,7 +896,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         });
 
         use tokio::io::AsyncWriteExt;
-        let prelude = "SET SESSION sql_log_bin=0;\nSET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\n";
+        let prelude = "SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\n";
         if let Err(e) = local_stdin.write_all(prelude.as_bytes()).await {
             fatal_failure_c.store(true, Ordering::SeqCst);
             record_failure(
