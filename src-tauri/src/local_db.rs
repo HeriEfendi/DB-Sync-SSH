@@ -17,7 +17,7 @@ pub fn build_local_connection_string(config: &LocalDbConfig) -> String {
         urlencoding::encode(&config.password),
         host,
         port,
-        config.database
+        urlencoding::encode(&config.database)
     )
 }
 
@@ -261,6 +261,7 @@ pub fn spawn_mysql_child(
             .arg("-i")
             .arg(container_name)
             .arg(cli)
+            .arg("--force")
             .arg("--skip-ssl")
             .arg("--local-infile=1")
             .arg("--quick")
@@ -300,6 +301,7 @@ pub fn spawn_mysql_child(
             .arg(port.to_string())
             .arg("-u")
             .arg(&local_config.username)
+            .arg("--force")
             .arg("--skip-ssl")
             .arg("--local-infile=1")
             .arg("--quick")
@@ -384,7 +386,7 @@ pub async fn get_all_tables_last_local_ids(
     let pk_rows = sqlx::query(pk_query)
         .fetch_all(&pool)
         .await
-        .unwrap_or_default();
+        .map_err(|e| format!("Gagal membaca metadata primary key lokal: {}", e))?;
 
     use std::collections::HashMap;
     let mut pk_columns: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
@@ -400,24 +402,12 @@ pub async fn get_all_tables_last_local_ids(
                 .push((c_name, data_type, column_type));
         }
     }
-    let mut pk_map: HashMap<String, String> = pk_columns
+    let pk_map: HashMap<String, String> = pk_columns
         .iter()
         .filter_map(|(table, columns)| {
             incremental_primary_key(columns).map(|column| (table.clone(), column))
         })
         .collect();
-
-    let updated_at_rows = sqlx::query(
-        "SELECT DISTINCT TABLE_NAME FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND LOWER(COLUMN_NAME) = 'updated_at'",
-    )
-    .fetch_all(&pool)
-    .await
-    .unwrap_or_default();
-    let tables_with_updated_at: std::collections::HashSet<String> = updated_at_rows
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("TABLE_NAME").ok())
-        .collect();
-    pk_map.retain(|table, _| tables_with_updated_at.contains(table));
 
     // 2. Target tables list
     let target_tables = match tables {

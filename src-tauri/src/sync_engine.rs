@@ -165,8 +165,10 @@ fn normalize_create_table_ddl(ddl: &str) -> String {
             index += 1;
             if tokens.get(index) == Some(&"=") {
                 index += 1;
-            }
-            if index < tokens.len() {
+                if index < tokens.len() && tokens[index].chars().all(|c| c.is_ascii_digit()) {
+                    index += 1;
+                }
+            } else if index < tokens.len() && tokens[index].chars().all(|c| c.is_ascii_digit()) {
                 index += 1;
             }
             continue;
@@ -301,7 +303,7 @@ pub async fn test_ssh_and_remote_db(
         urlencoding::encode(&remote_db_config.username),
         urlencoding::encode(&remote_db_config.password),
         tunnel.local_port,
-        remote_db_config.database
+        urlencoding::encode(&remote_db_config.database)
     );
 
     let pool = MySqlPoolOptions::new()
@@ -340,7 +342,7 @@ pub async fn get_remote_tables(
         urlencoding::encode(&remote_db_config.username),
         urlencoding::encode(&remote_db_config.password),
         tunnel.local_port,
-        remote_db_config.database
+        urlencoding::encode(&remote_db_config.database)
     );
 
     let pool = MySqlPoolOptions::new()
@@ -1317,9 +1319,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
                                 let ddl_sql = if table_is_fresh {
                                     format!(
-                                    "SET FOREIGN_KEY_CHECKS=0;\nDROP TABLE IF EXISTS {};\n{};\nSET FOREIGN_KEY_CHECKS=1;\n",
-                                    safe_table, ddl
-                                )
+                                        "SET FOREIGN_KEY_CHECKS=0;\nDROP TABLE IF EXISTS {};\n{};\n",
+                                        safe_table, ddl
+                                    )
                                 } else {
                                     let safe_create = if !ddl
                                         .to_uppercase()
@@ -1334,9 +1336,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                         ddl
                                     };
                                     format!(
-                                    "SET FOREIGN_KEY_CHECKS=0;\n{};\nSET FOREIGN_KEY_CHECKS=1;\n",
-                                    safe_create
-                                )
+                                        "SET FOREIGN_KEY_CHECKS=0;\n{};\n",
+                                        safe_create
+                                    )
                                 };
                                 if tx_c
                                     .send(PipelineMsg::Ddl {
