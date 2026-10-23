@@ -204,7 +204,7 @@ jobs:
           mkdir -p "$STAGING_DIR"
           cp -R "$APP_PATH" "$STAGING_DIR/"
           ln -s /Applications "$STAGING_DIR/Applications"
-          hdiutil create -volname "DB Sync Engine" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_NAME"
+          hdiutil create -volname "DB Sync Engine SSH" -srcfolder "$STAGING_DIR" -ov -format UDZO "$DMG_NAME"
           rm -rf "$STAGING_DIR"
           gh release upload "$RELEASE_TAG" "$DMG_NAME" --clobber
 
@@ -217,4 +217,4 @@ jobs:
           sudo apt-get install -y zstd
           VERSION="${RELEASE_TAG#v}"
           node scripts/create-arch-pkg.mjs "$VERSION"
-          gh release upload "$RELEASE_TAG" DB.Sync.Engine-*.pkg.tar.zst --clobber
+          gh release upload "$RELEASE_TAG" DB.Sync.Engine.SSH-*.pkg.tar.zst --clobber

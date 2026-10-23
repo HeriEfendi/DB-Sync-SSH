@@ -25,6 +25,7 @@
         @refresh-tables="fetchTables"
         @start-sync="handleStartSync"
         @save-template="handleSaveTemplate"
+        @update-template="handleUpdateTemplate"
         @edit-profile="handleEditProfile"
       />
 
@@ -205,17 +206,26 @@ function handleDeleteProfile(id) {
   saveProfiles(profiles.value);
 }
 
-function handleSaveTemplate({ name, tableNames }) {
-  if (!activeProfile.value) return;
-  if (!activeProfile.value.templates) {
-    activeProfile.value.templates = [];
+function handleSaveTemplate({ profileId, name, tableNames }) {
+  const profile = profiles.value.find((item) => item.id === profileId);
+  if (!profile) return;
+  if (!profile.templates) {
+    profile.templates = [];
   }
   const newTpl = {
     id: `tpl-${Date.now()}`,
     name,
     tableNames,
   };
-  activeProfile.value.templates.push(newTpl);
+  profile.templates.push(newTpl);
+  saveProfiles(profiles.value);
+}
+
+function handleUpdateTemplate({ profileId, templateId, tableNames }) {
+  const profile = profiles.value.find((item) => item.id === profileId);
+  const template = profile?.templates?.find((item) => item.id === templateId);
+  if (!template) return;
+  template.tableNames = tableNames;
   saveProfiles(profiles.value);
 }
 

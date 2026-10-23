@@ -59,6 +59,13 @@
               </option>
             </select>
             <button class="btn-secondary" @click="handleSaveTemplate">Save As New</button>
+            <button
+              class="btn-secondary"
+              :disabled="selectedTemplateId === 'all'"
+              @click="handleUpdateTemplate"
+            >
+              Update Template
+            </button>
           </div>
         </div>
       </div>
@@ -274,7 +281,13 @@ const props = defineProps({
   },
 });
 
-const emit = defineEmits(['refresh-tables', 'start-sync', 'save-template', 'edit-profile']);
+const emit = defineEmits([
+  'refresh-tables',
+  'start-sync',
+  'save-template',
+  'update-template',
+  'edit-profile',
+]);
 
 const searchInputRef = ref(null);
 const searchQuery = ref('');
@@ -285,6 +298,13 @@ const customRowLimit = ref(10000);
 
 // Per-table state: { selected: bool, sync_structure: bool, sync_data: bool }
 const tableStates = ref({});
+
+watch(
+  () => props.profile.id,
+  () => {
+    selectedTemplateId.value = 'all';
+  }
+);
 
 function initTableStates() {
   const newStates = {};
@@ -332,9 +352,7 @@ const isIndeterminate = computed(() => {
 
 function toggleSelectAllFiltered(checked) {
   filteredTables.value.forEach((tbl) => {
-    if (tableStates.value[tbl.name]) {
-      tableStates.value[tbl.name].selected = checked;
-    }
+    setTableSelected(tbl.name, checked);
   });
 }
 
@@ -342,13 +360,11 @@ function handleSelectAll() {
   const isFiltered = searchQuery.value.trim() !== '';
   if (isFiltered) {
     filteredTables.value.forEach((tbl) => {
-      if (tableStates.value[tbl.name]) {
-        tableStates.value[tbl.name].selected = true;
-      }
+      setTableSelected(tbl.name, true);
     });
   } else {
     Object.keys(tableStates.value).forEach((k) => {
-      tableStates.value[k].selected = true;
+      setTableSelected(k, true);
     });
   }
 }
@@ -357,13 +373,11 @@ function handleClearAll() {
   const isFiltered = searchQuery.value.trim() !== '';
   if (isFiltered) {
     filteredTables.value.forEach((tbl) => {
-      if (tableStates.value[tbl.name]) {
-        tableStates.value[tbl.name].selected = false;
-      }
+      setTableSelected(tbl.name, false);
     });
   } else {
     Object.keys(tableStates.value).forEach((k) => {
-      tableStates.value[k].selected = false;
+      setTableSelected(k, false);
     });
   }
 }
@@ -371,20 +385,29 @@ function handleClearAll() {
 function setGlobalMode(mode) {
   globalMode.value = mode;
   Object.keys(tableStates.value).forEach((k) => {
+    const state = tableStates.value[k];
     if (mode === 'both') {
-      tableStates.value[k].sync_structure = true;
-      tableStates.value[k].sync_data = true;
+      state.sync_structure = true;
+      state.sync_data = state.selected;
     } else {
-      tableStates.value[k].sync_structure = true;
-      tableStates.value[k].sync_data = false;
+      state.sync_structure = true;
+      state.sync_data = false;
     }
   });
 }
 
-function toggleTableSelect(tableName, checked) {
-  if (tableStates.value[tableName]) {
-    tableStates.value[tableName].selected = checked;
+function setTableSelected(tableName, selected) {
+  const state = tableStates.value[tableName];
+  if (state) {
+    state.selected = selected;
+    if (!selected) {
+      state.sync_data = false;
+    }
   }
+}
+
+function toggleTableSelect(tableName, checked) {
+  setTableSelected(tableName, checked);
 }
 
 function toggleMode(tableName, field, checked) {
@@ -405,7 +428,7 @@ function applyTemplate() {
   if (tpl && Array.isArray(tpl.tableNames)) {
     const set = new Set(tpl.tableNames);
     Object.keys(tableStates.value).forEach((tblName) => {
-      tableStates.value[tblName].selected = set.has(tblName);
+      setTableSelected(tblName, set.has(tblName));
     });
   }
 }
@@ -419,7 +442,26 @@ function handleSaveTemplate() {
     .map(([tblName]) => tblName);
 
   emit('save-template', {
+    profileId: props.profile.id,
     name: name.trim(),
+    tableNames: selectedNames,
+  });
+}
+
+function handleUpdateTemplate() {
+  if (selectedTemplateId.value === 'all') return;
+  const template = (props.profile.templates || []).find(
+    (item) => item.id === selectedTemplateId.value
+  );
+  if (!template) return;
+
+  const selectedNames = Object.entries(tableStates.value)
+    .filter(([_, state]) => state.selected)
+    .map(([tableName]) => tableName);
+
+  emit('update-template', {
+    profileId: props.profile.id,
+    templateId: template.id,
     tableNames: selectedNames,
   });
 }

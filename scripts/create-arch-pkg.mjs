@@ -23,8 +23,8 @@ if (!existsSync(binaryPath)) {
   throw new Error(`Release binary not found: ${binaryPath}`);
 }
 
-const appName = (config.productName || 'DB Sync Engine').replace(/\s+/g, '.');
-const packageName = `DB.Sync.Engine-${version}-x86_64.pkg.tar.zst`;
+const appName = (config.productName || 'DB Sync Engine SSH').replace(/\s+/g, '.');
+const packageName = `DB.Sync.Engine.SSH-${version}-x86_64.pkg.tar.zst`;
 const stageDir = mkdtempSync(path.join(os.tmpdir(), 'db-sync-ssh-pkg-'));
 const desktopDir = path.join(stageDir, 'usr/share/applications');
 
@@ -36,7 +36,7 @@ try {
   writeFileSync(
     path.join(desktopDir, 'db-sync-ssh.desktop'),
     `[Desktop Entry]
-Name=${config.productName || 'DB Sync Engine'}
+Name=${config.productName || 'DB Sync Engine SSH'}
 Comment=Synchronize MySQL and MariaDB databases over SSH
 Exec=db-sync-ssh
 Icon=db-sync-ssh

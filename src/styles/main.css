@@ -1,5 +1,5 @@
 /* ==========================================================================
-   DB Sync Engine - Modern Design System
+   DB Sync Engine SSH - Modern Design System
    ========================================================================== */
 
 :root {
@@ -137,9 +137,9 @@ body {
 }
 
 .sidebar-brand-icon {
-  width: 16px;
-  height: 16px;
-  color: #60a5fa;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
   flex-shrink: 0;
 }
 

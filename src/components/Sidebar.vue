@@ -3,8 +3,8 @@
     <div class="sidebar-top">
       <div class="sidebar-header">
         <div class="sidebar-brand-group">
-          <Database class="sidebar-brand-icon" :size="16" />
-          <span class="sidebar-brand-title">DB Sync Engine</span>
+          <img class="sidebar-brand-icon" src="/favicon.svg" alt="" />
+          <span class="sidebar-brand-title">DB Sync SSH</span>
           <span class="sidebar-version-badge">v{{ appVersion }}</span>
         </div>
       </div>
