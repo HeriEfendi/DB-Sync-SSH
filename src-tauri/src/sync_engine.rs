@@ -195,6 +195,7 @@ fn normalize_mysql_timestamp(value: &str) -> Option<String> {
         .map(|timestamp| timestamp.format("%Y-%m-%d %H:%M:%S%.f").to_string())
 }
 
+#[allow(dead_code)]
 fn normalize_create_table_ddl(ddl: &str) -> String {
     // Extract column/index definition body between first '(' and last ')'
     let body = match (ddl.find('('), ddl.rfind(')')) {
@@ -237,6 +238,7 @@ fn normalize_create_table_ddl(ddl: &str) -> String {
     normalized_tokens.join(" ")
 }
 
+#[allow(dead_code)]
 async fn get_table_create_ddl(
     pool: &sqlx::MySqlPool,
     table_name: &str,
@@ -265,6 +267,7 @@ async fn get_table_create_ddl(
     Ok(Some(ddl))
 }
 
+#[allow(dead_code)]
 fn build_chunk_where_clause(
     safe_pk: &str,
     current_last_id: Option<i128>,
@@ -509,6 +512,7 @@ pub enum PipelineMsg {
 #[derive(Debug)]
 pub enum DumpStreamItem {
     Bytes(Vec<u8>),
+    RowProgress(usize),
     Finished(Result<usize, String>),
 }
 
@@ -608,7 +612,12 @@ async fn dump_table_chunk_to_stream(
     use_replace: bool,
     stream_tx: tokio::sync::mpsc::Sender<DumpStreamItem>,
 ) -> Result<usize, String> {
-    let mut dump_cmd = crate::process_utils::new_tokio_command("mysqldump");
+    let dump_bin = if std::path::Path::new("/usr/bin/mariadb-dump").exists() {
+        "mariadb-dump"
+    } else {
+        "mysqldump"
+    };
+    let mut dump_cmd = crate::process_utils::new_tokio_command(dump_bin);
     dump_cmd
         .arg("-h")
         .arg("127.0.0.1")
@@ -645,7 +654,7 @@ async fn dump_table_chunk_to_stream(
 
     let mut dump_child = dump_cmd
         .spawn()
-        .map_err(|e| format!("Gagal menjalankan mysqldump: {}", e))?;
+        .map_err(|e| format!("Gagal menjalankan {}: {}", dump_bin, e))?;
 
     let dump_pid = dump_child.id();
     if let Some(pid) = dump_pid {
@@ -656,7 +665,7 @@ async fn dump_table_chunk_to_stream(
     let mut stderr = dump_child
         .stderr
         .take()
-        .ok_or_else(|| "Gagal membaca STDERR proses mysqldump".to_string())?;
+        .ok_or_else(|| format!("Gagal membaca STDERR proses {}", dump_bin))?;
     let stderr_task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
         let mut output = Vec::new();
@@ -674,7 +683,10 @@ async fn dump_table_chunk_to_stream(
 
     if let Some(mut stdout) = dump_child.stdout.take() {
         use tokio::io::AsyncReadExt;
-        let mut buffer = [0u8; 65536];
+        let mut buffer = [0u8; 131072];
+        let mut last_progress_rows = 0usize;
+        let mut last_progress_time = Instant::now();
+
         loop {
             if is_cancelled() {
                 let _ = dump_child.kill().await;
@@ -698,6 +710,17 @@ async fn dump_table_chunk_to_stream(
                         let _ = stderr_task.await;
                         return Err("Importer lokal berhenti menerima stream dump".to_string());
                     }
+
+                    if row_counter.total_rows >= last_progress_rows + 5000
+                        || (row_counter.total_rows > last_progress_rows
+                            && last_progress_time.elapsed().as_millis() >= 500)
+                    {
+                        let _ = stream_tx
+                            .send(DumpStreamItem::RowProgress(row_counter.total_rows))
+                            .await;
+                        last_progress_rows = row_counter.total_rows;
+                        last_progress_time = Instant::now();
+                    }
                 }
                 Err(e) => {
                     let _ = dump_child.kill().await;
@@ -706,7 +729,7 @@ async fn dump_table_chunk_to_stream(
                         unregister_child_pid(pid);
                     }
                     let _ = stderr_task.await;
-                    return Err(format!("Gagal membaca stream mysqldump: {}", e));
+                    return Err(format!("Gagal membaca stream {}: {}", dump_bin, e));
                 }
             }
         }
@@ -718,7 +741,7 @@ async fn dump_table_chunk_to_stream(
             if let Some(pid) = dump_pid {
                 unregister_child_pid(pid);
             }
-            return Err(format!("Gagal menunggu proses mysqldump: {}", e));
+            return Err(format!("Gagal menunggu proses {}: {}", dump_bin, e));
         }
     };
     if let Some(pid) = dump_pid {
@@ -726,12 +749,12 @@ async fn dump_table_chunk_to_stream(
     }
     let stderr_output = stderr_task
         .await
-        .map_err(|e| format!("Gagal mengambil keluaran error mysqldump: {}", e))?
-        .map_err(|e| format!("Gagal membaca STDERR mysqldump: {}", e))?;
+        .map_err(|e| format!("Gagal mengambil keluaran error {}: {}", dump_bin, e))?
+        .map_err(|e| format!("Gagal membaca STDERR {}: {}", dump_bin, e))?;
 
     if !is_cancelled() && !status.success() {
         let message = if stderr_output.is_empty() {
-            format!("mysqldump berhenti dengan status {}", status)
+            format!("{} berhenti dengan status {}", dump_bin, status)
         } else {
             stderr_output
         };
@@ -751,9 +774,8 @@ async fn dispatch_dump_chunk(
     where_clause: String,
     use_replace: bool,
 ) -> Result<usize, String> {
-    // Only two 64 KiB blocks can wait per stream; a slow local importer applies
-    // backpressure to mysqldump instead of allowing a whole chunk to accumulate.
-    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(2);
+    // 32 items buffer (up to ~4 MiB in flight) to keep pipeline continuously flowing
+    let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(32);
     let dump_config = remote_db_config.clone();
     let dump_table = table_name.to_string();
     let finish_tx = stream_tx.clone();
@@ -868,6 +890,18 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         .connect(&local_connection_string)
         .await
         .map_err(|e| format!("Gagal terhubung untuk memeriksa skema MySQL lokal: {}", e))?;
+
+    let local_tables_rows = sqlx::query(
+        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'",
+    )
+    .fetch_all(&local_schema_pool)
+    .await
+    .unwrap_or_default();
+    let existing_local_tables: HashSet<String> = local_tables_rows
+        .iter()
+        .filter_map(|r| r.try_get::<String, _>("TABLE_NAME").ok())
+        .collect();
+    let existing_local_tables = Arc::new(existing_local_tables);
 
     // Pre-query primary keys and update timestamp columns in batch queries.
     let pk_query = "
@@ -1005,7 +1039,13 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         });
 
         use tokio::io::AsyncWriteExt;
-        let prelude = "SET FOREIGN_KEY_CHECKS=0;\nSET UNIQUE_CHECKS=0;\nSET AUTOCOMMIT=1;\n";
+        let prelude = "SET SESSION sql_log_bin=0;\n\
+                       SET SESSION foreign_key_checks=0;\n\
+                       SET SESSION unique_checks=0;\n\
+                       SET SESSION autocommit=0;\n\
+                       SET SESSION sql_mode='';\n\
+                       SET SESSION net_read_timeout=600;\n\
+                       SET SESSION net_write_timeout=600;\n";
         if let Err(e) = local_stdin.write_all(prelude.as_bytes()).await {
             fatal_failure_c.store(true, Ordering::SeqCst);
             record_failure(
@@ -1123,10 +1163,26 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                         &failures_c,
                                         Some(&table_name),
                                         "Mengirim data ke MySQL lokal",
-                                        format!("Chunk {}: {}", chunk_num, e),
+                                        format!("Stream {}: {}", chunk_num, e),
                                     );
                                     chunk_written = false;
                                 }
+                            }
+                            Some(DumpStreamItem::RowProgress(current_rows)) => {
+                                emit_progress(
+                                    &app_consumer,
+                                    table_index,
+                                    total_tables_c,
+                                    completed_tables,
+                                    &completed_table_names,
+                                    &skipped_table_names,
+                                    &table_name,
+                                    current_rows,
+                                    total_rows_imported + current_rows,
+                                    "syncing",
+                                    started_at_c,
+                                    &failures_c,
+                                );
                             }
                             Some(DumpStreamItem::Finished(result)) => {
                                 match result {
@@ -1143,6 +1199,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                     }
 
                     if chunk_written && dump_succeeded && wrote_bytes {
+                        let _ = local_stdin.write_all(b"\nCOMMIT;\n").await;
                         if let Err(e) = local_stdin.flush().await {
                             stdin_failed = true;
                             fatal_failure_c.store(true, Ordering::SeqCst);
@@ -1151,7 +1208,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 &failures_c,
                                 Some(&table_name),
                                 "Flush data ke MySQL lokal",
-                                format!("Chunk {}: {}", chunk_num, e),
+                                format!("Tabel {}: {}", table_name, e),
                             );
                             chunk_written = false;
                         } else if !check_importer_running(
@@ -1203,6 +1260,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                     total_rows_synced,
                     sync_data,
                 } => {
+                    if touched_tables.contains(&table_name) {
+                        let _ = local_stdin.write_all(b"\nCOMMIT;\n").await;
+                    }
                     completed_tables += 1;
                     completed_table_names.insert(table_name.clone());
                     let no_data_rows = table_has_no_data_to_sync(
@@ -1277,7 +1337,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             }
         }
 
-        let postlude = "\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\n";
+        let postlude = "\nCOMMIT;\nSET FOREIGN_KEY_CHECKS=1;\nSET UNIQUE_CHECKS=1;\nSET AUTOCOMMIT=1;\n";
         if !is_cancelled() {
             if let Err(e) = local_stdin.write_all(postlude.as_bytes()).await {
                 fatal_failure_c.store(true, Ordering::SeqCst);
@@ -1358,7 +1418,6 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     // Producer Tasks: 2 Download Workers over SSH Tunnel
     // ----------------------------------------------------
     let mut download_handles = Vec::new();
-    const CHUNK_SIZE: usize = 50_000;
 
     for worker_id in 0..download_concurrency {
         let queue_c = tables_queue.clone();
@@ -1370,7 +1429,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let app_c = app.clone();
         let failures_p = failures.clone();
         let tx_c = tx.clone();
-        let local_schema_pool_c = local_schema_pool.clone();
+        let local_tables_c = existing_local_tables.clone();
         let row_limit_opt = sync_options.row_limit;
 
         let handle = tokio::spawn(async move {
@@ -1405,9 +1464,13 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 };
 
                 let mut table_is_fresh = is_fresh;
+                if !table_is_fresh && !local_tables_c.contains(table_name) {
+                    table_is_fresh = true;
+                }
 
                 // A. Structure DDL
-                if table_item.sync_structure {
+                let need_structure_ddl = table_item.sync_structure && (is_fresh || !local_tables_c.contains(table_name));
+                if need_structure_ddl {
                     emit_log(
                         &app_c,
                         "info",
@@ -1437,49 +1500,6 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 }
                             };
                             if !ddl.is_empty() {
-                                if !is_fresh {
-                                    match get_table_create_ddl(&local_schema_pool_c, table_name)
-                                        .await
-                                    {
-                                        Ok(local_ddl) => {
-                                            let schema_changed =
-                                                local_ddl.as_deref().is_none_or(|local| {
-                                                    normalize_create_table_ddl(local)
-                                                        != normalize_create_table_ddl(&ddl)
-                                                });
-                                            if schema_changed {
-                                                table_is_fresh = true;
-                                                emit_log(
-                                                    &app_c,
-                                                    "warning",
-                                                    format!(
-                                                        "[Tabel '{}'] Skema lokal berbeda dari remote; tabel ini diproses sebagai fresh sync dengan batas baris UI.",
-                                                        table_name
-                                                    ),
-                                                );
-                                            }
-                                        }
-                                        Err(e) => {
-                                            record_failure(
-                                                &app_c,
-                                                &failures_p,
-                                                Some(table_name),
-                                                "Membandingkan skema tabel lokal dan remote",
-                                                e,
-                                            );
-                                            let _ = tx_c
-                                                .send(PipelineMsg::TableSkipped {
-                                                    table_name: table_name.clone(),
-                                                    table_index: idx + 1,
-                                                    reason: "skema lokal tidak dapat diverifikasi"
-                                                        .to_string(),
-                                                })
-                                                .await;
-                                            continue;
-                                        }
-                                    }
-                                }
-
                                 let ddl_sql = if table_is_fresh {
                                     format!(
                                         "SET FOREIGN_KEY_CHECKS=0;\nDROP TABLE IF EXISTS {};\n{};\n",
@@ -1534,7 +1554,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                     }
                 }
 
-                // B. Data Sync (with Chunking for large tables)
+                // B. Data Sync (High-Performance Direct Streaming)
                 if table_item.sync_data {
                     let pk_col_opt = pk_map_c.get(table_name).cloned();
                     let watermark = if !table_is_fresh {
@@ -1548,7 +1568,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
                     let mut total_table_rows = 0usize;
 
-                    if let Some(ref pk_col) = pk_col_opt {
+                    let (where_clause, sync_desc) = if let Some(ref pk_col) = pk_col_opt {
                         let watermark_id = watermark.and_then(|wm| {
                             (wm.primary_key.eq_ignore_ascii_case(pk_col.as_str()))
                                 .then(|| wm.last_id.parse::<i128>().ok())
@@ -1567,246 +1587,194 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             .zip(updated_at_col.as_deref())
                             .zip(watermark_timestamp.as_deref())
                             .map(|((id, column), timestamp)| (id, column, timestamp));
-                        let use_updated_at_filter = update_filter.is_some();
-                        let start_id = if watermark_id.is_some() && !use_updated_at_filter {
-                            emit_log(
-                                &app_c,
-                                "warning",
-                                format!(
-                                    "[Tabel '{}'] Kolom updated_at tersedia, tetapi waktu watermark sebelumnya belum ada atau formatnya tidak dikenali; memakai full upsert agar perubahan baris lama tetap tertangkap.",
-                                    table_name
-                                ),
-                            );
-                            None
-                        } else if use_updated_at_filter {
-                            None
-                        } else {
-                            watermark_id
-                        };
-                        let mut current_last_id = start_id;
-                        let mut chunk_num = 1;
 
-                        if let Some((_, _, timestamp)) = update_filter {
-                            emit_log(
-                                &app_c,
-                                "info",
-                                format!(
-                                    "[{}/{}] ⚡ [Worker {}] Sync baris baru dan perubahan '{}' sejak {} (PK: {})...",
-                                    idx + 1,
-                                    total_tables,
-                                    worker_id + 1,
-                                    table_name,
-                                    timestamp,
-                                    pk_col
-                                ),
-                            );
-                        } else if let Some(start_id) = start_id {
-                            emit_log(
-                                &app_c,
-                                "info",
-                                format!(
-                                    "[{}/{}] ⚡ [Worker {}] Sync New & Update '{}' setelah ID {} (PK: {})...",
-                                    idx + 1,
-                                    total_tables,
-                                    worker_id + 1,
-                                    table_name,
-                                    start_id,
-                                    pk_col
-                                ),
-                            );
-                        } else if is_fresh {
-                            emit_log(
-                                &app_c,
-                                "info",
-                                format!(
-                                    "[{}/{}] 🔄 [Worker {}] Fresh Sync tabel '{}'...",
-                                    idx + 1,
-                                    total_tables,
-                                    worker_id + 1,
-                                    table_name
-                                ),
-                            );
-                        }
-
-                        loop {
-                            if is_cancelled() {
-                                break;
-                            }
-
-                            let this_chunk_limit = match row_limit_opt {
-                                Some(lim) => {
-                                    if total_table_rows >= lim {
-                                        break;
-                                    }
-                                    (lim - total_table_rows).min(CHUNK_SIZE)
+                        // FAST-CHECK: If incremental with watermark, check if rows actually exist before mysqldump
+                        if !table_is_fresh {
+                            let filter_cond = match (update_filter, watermark_id) {
+                                (Some((w_id, col, ts)), _) => {
+                                    Some(format!("{} > {} OR {} >= '{}'", safe_pk, w_id, col, ts))
                                 }
-                                None => CHUNK_SIZE,
+                                (None, Some(w_id)) => Some(format!("{} > {}", safe_pk, w_id)),
+                                _ => None,
                             };
 
-                            // Fast index-only covering scan to find upper bound of this chunk
-                            let bound_condition = current_last_id
-                                .map(|last_id| format!("{} > {}", safe_pk, last_id))
-                                .unwrap_or_else(|| "1=1".to_string());
-                            let bound_q = format!(
-                                "SELECT CAST(MAX(t.pk) AS CHAR), COUNT(*) FROM (SELECT {} AS pk FROM {} WHERE {} ORDER BY {} ASC LIMIT {}) AS t",
-                                safe_pk, safe_table, bound_condition, safe_pk, this_chunk_limit
-                            );
-
-                            let (max_pk_in_chunk, keys_in_chunk): (Option<i128>, u64) =
-                                match sqlx::query(&bound_q).fetch_one(&*pool_c).await {
-                                    Ok(row) => {
-                                        let max_pk = match row.try_get::<Option<String>, _>(0) {
-                                            Ok(Some(value)) => match value.parse::<i128>() {
-                                                Ok(value) => Some(value),
-                                                Err(e) => {
-                                                    record_failure(
-                                                        &app_c,
-                                                        &failures_p,
-                                                        Some(table_name),
-                                                        "Membaca batas primary key",
-                                                        format!("Nilai primary key tidak valid '{}': {}", value, e),
-                                                    );
-                                                    break;
-                                                }
-                                            },
-                                            Ok(None) => None,
-                                            Err(e) => {
-                                                record_failure(
-                                                    &app_c,
-                                                    &failures_p,
-                                                    Some(table_name),
-                                                    "Membaca batas primary key",
-                                                    e.to_string(),
-                                                );
-                                                break;
-                                            }
-                                        };
-                                        let key_count = match row.try_get::<i64, _>(1) {
-                                            Ok(value) => {
-                                                match u64::try_from(value) {
-                                                    Ok(value) => value,
-                                                    Err(e) => {
-                                                        record_failure(
-                                                        &app_c,
-                                                        &failures_p,
-                                                        Some(table_name),
-                                                        "Membaca jumlah baris chunk",
-                                                        format!("Jumlah baris chunk tidak valid: {}", e),
-                                                    );
-                                                        break;
-                                                    }
-                                                }
-                                            }
-                                            Err(e) => {
-                                                record_failure(
-                                                    &app_c,
-                                                    &failures_p,
-                                                    Some(table_name),
-                                                    "Membaca jumlah baris chunk",
-                                                    e.to_string(),
-                                                );
-                                                break;
-                                            }
-                                        };
-                                        (max_pk, key_count)
-                                    }
-                                    Err(e) => {
-                                        record_failure(
-                                            &app_c,
-                                            &failures_p,
-                                            Some(table_name),
-                                            "Mencari batas chunk data remote",
-                                            e.to_string(),
-                                        );
-                                        break;
-                                    }
+                            if let Some(ref cond) = filter_cond {
+                                let check_sql = format!("SELECT 1 FROM {} WHERE ({}) LIMIT 1", safe_table, cond);
+                                let has_changes = match sqlx::query(&check_sql).fetch_optional(&*pool_c).await {
+                                    Ok(Some(_)) => true,
+                                    Ok(None) => false,
+                                    Err(_) => true,
                                 };
 
-                            let chunk_max = match max_pk_in_chunk {
-                                Some(m) if current_last_id.is_none_or(|last_id| m > last_id) => m,
-                                _ => break, // No more rows in table!
-                            };
-
-                            let where_clause = build_chunk_where_clause(
-                                &safe_pk,
-                                current_last_id,
-                                chunk_max,
-                                update_filter,
-                            );
-
-                            match dispatch_dump_chunk(
-                                &tx_c,
-                                tunnel_port,
-                                &remote_cfg_c,
-                                table_name,
-                                idx + 1,
-                                chunk_num,
-                                where_clause,
-                                !table_is_fresh,
-                            )
-                            .await
-                            {
-                                Ok(rows_in_chunk) => {
-                                    total_table_rows += rows_in_chunk;
-                                    current_last_id = Some(chunk_max);
-                                    chunk_num += 1;
-
-                                    if keys_in_chunk < this_chunk_limit as u64 {
-                                        break;
-                                    }
-                                }
-                                Err(e) => {
-                                    if !is_cancelled() {
+                                if !has_changes {
+                                    // ZERO rows changed! Skip table immediately without spawning mysqldump!
+                                    if tx_c
+                                        .send(PipelineMsg::TableFinished {
+                                            table_name: table_name.clone(),
+                                            table_index: idx + 1,
+                                            total_rows_synced: 0,
+                                            sync_data: table_item.sync_data,
+                                        })
+                                        .await
+                                        .is_err()
+                                        && !is_cancelled()
+                                    {
                                         record_failure(
                                             &app_c,
                                             &failures_p,
                                             Some(table_name),
-                                            &format!("Dump chunk {}", chunk_num),
-                                            e,
+                                            "Menyelesaikan tabel",
+                                            "Worker impor lokal sudah berhenti",
                                         );
                                     }
-                                    break;
+                                    continue;
+                                }
+                            } else if watermark.is_none() {
+                                let check_sql = format!("SELECT 1 FROM {} LIMIT 1", safe_table);
+                                if let Ok(None) = sqlx::query(&check_sql).fetch_optional(&*pool_c).await {
+                                    if tx_c
+                                        .send(PipelineMsg::TableFinished {
+                                            table_name: table_name.clone(),
+                                            table_index: idx + 1,
+                                            total_rows_synced: 0,
+                                            sync_data: table_item.sync_data,
+                                        })
+                                        .await
+                                        .is_err()
+                                        && !is_cancelled()
+                                    {
+                                        record_failure(
+                                            &app_c,
+                                            &failures_p,
+                                            Some(table_name),
+                                            "Menyelesaikan tabel",
+                                            "Worker impor lokal sudah berhenti",
+                                        );
+                                    }
+                                    continue;
                                 }
                             }
                         }
-                    } else {
-                        emit_log(
-                            &app_c,
-                            "warning",
-                            format!(
-                                "[Tabel '{}'] Mode incremental perlu satu primary key kolom id bertipe integer dan kolom updated_at; memakai full upsert.",
-                                table_name
+
+                        match (update_filter, watermark_id, row_limit_opt) {
+                            (Some((w_id, col, ts)), _, Some(lim)) => (
+                                format!(
+                                    "--where=({} > {} OR {} >= '{}') LIMIT {}",
+                                    safe_pk, w_id, col, ts, lim
+                                ),
+                                format!(
+                                    "Sync baris baru dan perubahan '{}' sejak {} (PK: {})...",
+                                    table_name, ts, pk_col
+                                ),
                             ),
-                        );
-                        let where_clause = match row_limit_opt {
-                            Some(lim) if lim > 0 => format!("--where=1 LIMIT {}", lim),
-                            _ => String::new(),
-                        };
-                        match dispatch_dump_chunk(
-                            &tx_c,
-                            tunnel_port,
-                            &remote_cfg_c,
-                            table_name,
-                            idx + 1,
-                            1,
-                            where_clause,
-                            !table_is_fresh,
-                        )
-                        .await
-                        {
-                            Ok(rows_in_chunk) => {
-                                total_table_rows += rows_in_chunk;
-                            }
-                            Err(e) => {
-                                if !is_cancelled() {
+                            (Some((w_id, col, ts)), _, None) => (
+                                format!(
+                                    "--where=({} > {} OR {} >= '{}')",
+                                    safe_pk, w_id, col, ts
+                                ),
+                                format!(
+                                    "Sync baris baru dan perubahan '{}' sejak {} (PK: {})...",
+                                    table_name, ts, pk_col
+                                ),
+                            ),
+                            (None, Some(w_id), Some(lim)) => (
+                                format!("--where={} > {} LIMIT {}", safe_pk, w_id, lim),
+                                format!(
+                                    "Sync New & Update '{}' setelah ID {} (PK: {})...",
+                                    table_name, w_id, pk_col
+                                ),
+                            ),
+                            (None, Some(w_id), None) => (
+                                format!("--where={} > {}", safe_pk, w_id),
+                                format!(
+                                    "Sync New & Update '{}' setelah ID {} (PK: {})...",
+                                    table_name, w_id, pk_col
+                                ),
+                            ),
+                            (None, None, Some(lim)) => (
+                                format!("--where=1 LIMIT {}", lim),
+                                format!("Fresh Sync tabel '{}' (limit: {})...", table_name, lim),
+                            ),
+                            (None, None, None) => (
+                                String::new(),
+                                format!("Fresh Sync tabel '{}'...", table_name),
+                            ),
+                        }
+                    } else {
+                        if !table_is_fresh {
+                            let check_sql = format!("SELECT 1 FROM {} LIMIT 1", safe_table);
+                            if let Ok(None) = sqlx::query(&check_sql).fetch_optional(&*pool_c).await {
+                                if tx_c
+                                    .send(PipelineMsg::TableFinished {
+                                        table_name: table_name.clone(),
+                                        table_index: idx + 1,
+                                        total_rows_synced: 0,
+                                        sync_data: table_item.sync_data,
+                                    })
+                                    .await
+                                    .is_err()
+                                    && !is_cancelled()
+                                {
                                     record_failure(
                                         &app_c,
                                         &failures_p,
                                         Some(table_name),
-                                        "Dump data tabel",
-                                        e,
+                                        "Menyelesaikan tabel",
+                                        "Worker impor lokal sudah berhenti",
                                     );
                                 }
+                                continue;
+                            }
+                        }
+
+                        match row_limit_opt {
+                            Some(lim) if lim > 0 => (
+                                format!("--where=1 LIMIT {}", lim),
+                                format!("Sync tabel '{}' (limit: {})...", table_name, lim),
+                            ),
+                            _ => (
+                                String::new(),
+                                format!("Sync tabel '{}'...", table_name),
+                            ),
+                        }
+                    };
+
+                    emit_log(
+                        &app_c,
+                        "info",
+                        format!(
+                            "[{}/{}] ⚡ [Worker {}] {}",
+                            idx + 1,
+                            total_tables,
+                            worker_id + 1,
+                            sync_desc
+                        ),
+                    );
+
+                    match dispatch_dump_chunk(
+                        &tx_c,
+                        tunnel_port,
+                        &remote_cfg_c,
+                        table_name,
+                        idx + 1,
+                        1,
+                        where_clause,
+                        !table_is_fresh,
+                    )
+                    .await
+                    {
+                        Ok(rows_streamed) => {
+                            total_table_rows = rows_streamed;
+                        }
+                        Err(e) => {
+                            if !is_cancelled() {
+                                record_failure(
+                                    &app_c,
+                                    &failures_p,
+                                    Some(table_name),
+                                    "Dump data tabel",
+                                    e,
+                                );
                             }
                         }
                     }
