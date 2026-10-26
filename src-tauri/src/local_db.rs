@@ -482,6 +482,50 @@ pub async fn get_all_tables_last_local_ids(
     Ok(results)
 }
 
+pub async fn drop_local_tables(
+    config: &LocalDbConfig,
+    tables: Vec<String>,
+) -> Result<Vec<String>, String> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let conn_str = build_local_connection_string(config);
+    let pool = MySqlPoolOptions::new()
+        .max_connections(2)
+        .acquire_timeout(std::time::Duration::from_secs(6))
+        .connect(&conn_str)
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    let mut conn = pool
+        .acquire()
+        .await
+        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut *conn).await;
+
+    let mut dropped = Vec::new();
+    for table_name in tables {
+        let safe_table = match sanitize_identifier(&table_name) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+        let query = format!("DROP TABLE IF EXISTS {}", safe_table);
+        if let Err(e) = sqlx::query(&query).execute(&mut *conn).await {
+            eprintln!("Gagal drop tabel lokal '{}': {}", table_name, e);
+        } else {
+            dropped.push(table_name);
+        }
+    }
+
+    let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=1").execute(&mut *conn).await;
+    drop(conn);
+    pool.close().await;
+
+    Ok(dropped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{build_create_database_sql, validate_docker_container};

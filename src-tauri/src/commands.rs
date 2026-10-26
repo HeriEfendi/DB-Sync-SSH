@@ -34,6 +34,11 @@ pub async fn get_local_tables(config: LocalDbConfig) -> Result<Vec<String>, Stri
 }
 
 #[tauri::command]
+pub async fn drop_local_tables(config: LocalDbConfig, tables: Vec<String>) -> Result<Vec<String>, String> {
+    crate::local_db::drop_local_tables(&config, tables).await
+}
+
+#[tauri::command]
 pub async fn get_all_tables_last_local_ids(
     config: LocalDbConfig,
     tables: Option<Vec<String>>,
