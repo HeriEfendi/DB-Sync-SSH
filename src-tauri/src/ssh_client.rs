@@ -24,6 +24,7 @@ pub fn establish_ssh_session(config: &SshConfig) -> Result<Session, String> {
     let tcp = TcpStream::connect_timeout(&socket_addr, Duration::from_secs(10))
         .map_err(|e| format!("Gagal terhubung ke SSH {}: {}", addr_str, e))?;
 
+    tcp.set_nodelay(true).ok();
     tcp.set_read_timeout(Some(Duration::from_secs(30))).ok();
     tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
@@ -184,6 +185,27 @@ pub fn start_ssh_tunnel(
         remote_db_config.port
     };
 
+    let session_pool: Arc<std::sync::Mutex<Vec<Session>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
+    // Pre-warm authenticated SSH sessions in background so initial connections connect in 0ms
+    let pool_prewarm = session_pool.clone();
+    let ssh_cfg_prewarm = ssh_cfg.clone();
+    let stop_prewarm = stop_flag_thread.clone();
+    std::thread::spawn(move || {
+        for _ in 0..2 {
+            if stop_prewarm.load(Ordering::SeqCst) {
+                break;
+            }
+            if let Ok(sess) = establish_ssh_session(&ssh_cfg_prewarm) {
+                if let Ok(mut lock) = pool_prewarm.lock() {
+                    lock.push(sess);
+                }
+            }
+        }
+    });
+
+    let pool_listener = session_pool.clone();
     std::thread::spawn(move || {
         while !stop_flag_thread.load(Ordering::SeqCst) {
             match listener.accept() {
@@ -191,13 +213,20 @@ pub fn start_ssh_tunnel(
                     let ssh_cfg_worker = ssh_cfg.clone();
                     let r_host = remote_host.clone();
                     let stop_worker = stop_flag_thread.clone();
+                    let pool_worker = pool_listener.clone();
 
                     std::thread::spawn(move || {
-                        let session = match establish_ssh_session(&ssh_cfg_worker) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("[SshTunnel] Gagal membuat sesi SSH untuk client: {}", e);
-                                return;
+                        let session = {
+                            let pooled = pool_worker.lock().ok().and_then(|mut p| p.pop());
+                            match pooled {
+                                Some(s) if s.authenticated() => s,
+                                _ => match establish_ssh_session(&ssh_cfg_worker) {
+                                    Ok(s) => s,
+                                    Err(e) => {
+                                        eprintln!("[SshTunnel] Gagal membuat sesi SSH untuk client: {}", e);
+                                        return;
+                                    }
+                                },
                             }
                         };
                         session.set_blocking(false);
@@ -209,7 +238,7 @@ pub fn start_ssh_tunnel(
                             match session.channel_direct_tcpip(&r_host, remote_port, None) {
                                 Ok(c) => break c,
                                 Err(e) if e.code() == ssh2::ErrorCode::Session(-37) => {
-                                    std::thread::sleep(Duration::from_millis(10));
+                                    std::thread::sleep(Duration::from_millis(5));
                                 }
                                 Err(e) => {
                                     eprintln!("[SshTunnel] Gagal membuka direct-tcpip channel: {}", e);
@@ -218,9 +247,13 @@ pub fn start_ssh_tunnel(
                             }
                         };
 
+                        local_stream.set_nodelay(true).ok();
                         local_stream.set_nonblocking(true).ok();
-                        let mut local_buf = [0u8; 16384];
-                        let mut remote_buf = [0u8; 16384];
+
+                        // 128 KiB high-throughput buffers (8x larger than default 16KB)
+                        let mut local_buf = [0u8; 131072];
+                        let mut remote_buf = [0u8; 131072];
+                        let mut idle_spins = 0u32;
 
                         while !stop_worker.load(Ordering::SeqCst) {
                             let mut did_work = false;
@@ -237,12 +270,11 @@ pub fn start_ssh_tunnel(
                                                 did_work = true;
                                             }
                                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                std::thread::sleep(Duration::from_millis(1));
+                                                std::thread::yield_now();
                                             }
                                             Err(_) => return,
                                         }
                                     }
-                                    let _ = channel.flush();
                                 }
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                 Err(_) => break,
@@ -260,25 +292,43 @@ pub fn start_ssh_tunnel(
                                                 did_work = true;
                                             }
                                             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                                std::thread::sleep(Duration::from_millis(1));
+                                                std::thread::yield_now();
                                             }
                                             Err(_) => return,
                                         }
                                     }
-                                    let _ = local_stream.flush();
                                 }
                                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                                 Err(_) => break,
                             }
 
-                            if !did_work {
-                                std::thread::sleep(Duration::from_millis(1));
+                            if did_work {
+                                idle_spins = 0;
+                            } else {
+                                idle_spins += 1;
+                                if idle_spins < 8 {
+                                    std::thread::yield_now();
+                                } else if idle_spins < 32 {
+                                    std::thread::sleep(Duration::from_micros(100));
+                                } else {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                        }
+
+                        // Return healthy session to pool for immediate reuse
+                        if session.authenticated() && !stop_worker.load(Ordering::SeqCst) {
+                            if let Ok(mut lock) = pool_worker.lock() {
+                                if lock.len() < 3 {
+                                    session.set_blocking(true);
+                                    lock.push(session);
+                                }
                             }
                         }
                     });
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(50));
+                    std::thread::sleep(Duration::from_millis(20));
                 }
                 Err(e) => {
                     eprintln!("[SshTunnel] Error accept: {}", e);
