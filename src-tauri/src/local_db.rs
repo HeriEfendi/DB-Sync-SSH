@@ -279,8 +279,11 @@ pub fn spawn_mysql_child(
             .arg("--force")
             .arg("--skip-ssl")
             .arg("--local-infile=1")
+            .arg("--binary-mode")
             .arg("--quick")
             .arg("--max-allowed-packet=1024M")
+            .arg("--net-buffer-length=1M")
+            .arg("--default-character-set=utf8mb4")
             .arg("-u")
             .arg(&local_config.username);
 
@@ -319,8 +322,10 @@ pub fn spawn_mysql_child(
             .arg("--force")
             .arg("--skip-ssl")
             .arg("--local-infile=1")
+            .arg("--binary-mode")
             .arg("--quick")
             .arg("--max-allowed-packet=1024M")
+            .arg("--net-buffer-length=1M")
             .arg("--default-character-set=utf8mb4");
 
         if !local_config.password.is_empty() {
