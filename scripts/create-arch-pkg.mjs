@@ -40,6 +40,7 @@ Name=${config.productName || 'DB Sync Engine SSH'}
 Comment=Synchronize MySQL and MariaDB databases over SSH
 Exec=db-sync-ssh
 Icon=db-sync-ssh
+StartupWMClass=db-sync-ssh
 Terminal=false
 Type=Application
 Categories=Development;Database;Utility;
