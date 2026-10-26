@@ -126,6 +126,52 @@ fn table_has_failure(failures: &Arc<Mutex<Vec<SyncFailure>>>, table_name: &str) 
         .any(|failure| failure.table_name.as_deref() == Some(table_name))
 }
 
+fn table_has_no_data_to_sync(sync_data: bool, rows_synced: usize, has_failure: bool) -> bool {
+    sync_data && rows_synced == 0 && !has_failure
+}
+
+fn progress_table_counts(
+    completed_table_names: &HashSet<String>,
+    skipped_table_names: &HashSet<String>,
+    failures: &[SyncFailure],
+) -> (usize, usize, usize, usize) {
+    let failed_table_names: HashSet<&str> = failures
+        .iter()
+        .filter_map(|failure| failure.table_name.as_deref())
+        .collect();
+    let skipped_tables = skipped_table_names
+        .iter()
+        .filter(|table_name| !failed_table_names.contains(table_name.as_str()))
+        .count();
+    let successful_tables = completed_table_names
+        .iter()
+        .filter(|table_name| {
+            !skipped_table_names.contains(*table_name)
+                && !failed_table_names.contains(table_name.as_str())
+        })
+        .count();
+    let processed_tables = completed_table_names
+        .iter()
+        .map(String::as_str)
+        .chain(failed_table_names.iter().copied())
+        .collect::<HashSet<_>>()
+        .len();
+
+    (
+        processed_tables,
+        successful_tables,
+        failed_table_names.len(),
+        skipped_tables,
+    )
+}
+
+fn has_mysql_cli_errors(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("ERROR ") || line.starts_with("ERROR:")
+    })
+}
+
 fn resolve_sync_status(
     was_cancelled: bool,
     fatal_failure: bool,
@@ -281,18 +327,39 @@ pub fn emit_progress<R: tauri::Runtime>(
     current_table_index: usize,
     total_tables: usize,
     completed_tables: usize,
+    completed_table_names: &HashSet<String>,
+    skipped_table_names: &HashSet<String>,
     current_table_name: &str,
     rows_synced_current_table: usize,
     total_synced_all_tables: usize,
     status: &str,
+    start_time: Instant,
+    failures: &Arc<Mutex<Vec<SyncFailure>>>,
 ) {
+    let failures_snapshot = failures
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let (processed_tables, successful_tables, failed_tables, skipped_tables) =
+        progress_table_counts(
+            completed_table_names,
+            skipped_table_names,
+            &failures_snapshot,
+        );
     let payload = ProgressPayload {
         current_table_index,
         total_tables,
         completed_tables,
+        completed_table_names: completed_table_names.iter().cloned().collect(),
+        skipped_table_names: skipped_table_names.iter().cloned().collect(),
         current_table_name: current_table_name.to_string(),
         rows_synced_current_table,
         total_synced_all_tables,
+        processed_tables,
+        successful_tables,
+        failed_tables,
+        skipped_tables,
+        elapsed_ms: start_time.elapsed().as_millis() as u64,
         status: status.to_string(),
     };
     let _ = app.emit("sync-progress", payload);
@@ -430,6 +497,7 @@ pub enum PipelineMsg {
         table_name: String,
         table_index: usize,
         total_rows_synced: usize,
+        sync_data: bool,
     },
     TableSkipped {
         table_name: String,
@@ -444,35 +512,92 @@ pub enum DumpStreamItem {
     Finished(Result<usize, String>),
 }
 
-fn count_row_delimiters(chunk: &[u8], carry: &mut Vec<u8>) -> usize {
-    let mut count = 0;
-    let carry_len = carry.len();
-    if carry_len > 0 {
-        let seam_len = chunk.len().min(8);
-        let mut seam = Vec::with_capacity(carry_len + seam_len);
-        seam.extend_from_slice(carry);
-        seam.extend_from_slice(&chunk[..seam_len]);
+#[derive(Default)]
+struct MysqlDumpRowCounter {
+    word: Vec<u8>,
+    in_insert: bool,
+    in_values: bool,
+    quote: Option<u8>,
+    escaped: bool,
+    tuple_depth: usize,
+    expect_tuple: bool,
+    total_rows: usize,
+}
 
-        let seam_str = String::from_utf8_lossy(&seam);
-        for pat in &["VALUES (", "values (", "VALUES(", "values(", "),("] {
-            for (idx, _) in seam_str.match_indices(pat) {
-                if idx < carry_len && idx + pat.len() > carry_len {
-                    count += 1;
+impl MysqlDumpRowCounter {
+    fn push(&mut self, chunk: &[u8]) -> usize {
+        let previous_total = self.total_rows;
+        for &byte in chunk {
+            if let Some(quote) = self.quote {
+                if self.escaped {
+                    self.escaped = false;
+                } else if byte == b'\\' {
+                    self.escaped = true;
+                } else if byte == quote {
+                    self.quote = None;
                 }
+                continue;
+            }
+
+            if matches!(byte, b'\'' | b'"' | b'`') {
+                self.finish_word();
+                self.quote = Some(byte);
+                continue;
+            }
+
+            if byte.is_ascii_alphanumeric() || byte == b'_' {
+                self.word.push(byte.to_ascii_uppercase());
+                continue;
+            }
+
+            self.finish_word();
+            match byte {
+                b'(' if self.in_values => {
+                    if self.tuple_depth == 0 && self.expect_tuple {
+                        self.total_rows += 1;
+                        self.expect_tuple = false;
+                    }
+                    self.tuple_depth += 1;
+                }
+                b')' if self.in_values && self.tuple_depth > 0 => {
+                    self.tuple_depth -= 1;
+                }
+                b',' if self.in_values && self.tuple_depth == 0 => {
+                    self.expect_tuple = true;
+                }
+                b';' => {
+                    self.in_insert = false;
+                    self.in_values = false;
+                    self.expect_tuple = false;
+                    self.tuple_depth = 0;
+                }
+                _ => {}
             }
         }
+        self.total_rows - previous_total
     }
 
-    let chunk_str = String::from_utf8_lossy(chunk);
-    for pat in &["VALUES (", "values (", "VALUES(", "values(", "),("] {
-        count += chunk_str.match_indices(pat).count();
+    fn finish_word(&mut self) {
+        if self.word.is_empty() {
+            return;
+        }
+
+        match self.word.as_slice() {
+            b"INSERT" | b"REPLACE" => {
+                self.in_insert = true;
+                self.in_values = false;
+                self.expect_tuple = false;
+                self.tuple_depth = 0;
+            }
+            b"VALUES" if self.in_insert => {
+                self.in_values = true;
+                self.expect_tuple = true;
+                self.tuple_depth = 0;
+            }
+            _ => {}
+        }
+        self.word.clear();
     }
-
-    let tail_len = chunk.len().min(8);
-    carry.clear();
-    carry.extend_from_slice(&chunk[chunk.len() - tail_len..]);
-
-    count
 }
 
 async fn dump_table_chunk_to_stream(
@@ -527,8 +652,7 @@ async fn dump_table_chunk_to_stream(
         register_child_pid(pid);
     }
 
-    let mut rows_count = 0usize;
-    let mut row_carry: Vec<u8> = Vec::new();
+    let mut row_counter = MysqlDumpRowCounter::default();
     let mut stderr = dump_child
         .stderr
         .take()
@@ -560,7 +684,7 @@ async fn dump_table_chunk_to_stream(
                 Ok(0) => break,
                 Ok(n) => {
                     let chunk = &buffer[..n];
-                    rows_count += count_row_delimiters(chunk, &mut row_carry);
+                    row_counter.push(chunk);
                     if stream_tx
                         .send(DumpStreamItem::Bytes(chunk.to_vec()))
                         .await
@@ -614,7 +738,7 @@ async fn dump_table_chunk_to_stream(
         return Err(message);
     }
 
-    Ok(rows_count)
+    Ok(row_counter.total_rows)
 }
 
 async fn dispatch_dump_chunk(
@@ -737,22 +861,6 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         }
     };
 
-    let estimate_rows = sqlx::query(
-        "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) AS estimated_rows FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'",
-    )
-    .fetch_all(&*remote_pool)
-    .await
-    .map_err(|e| format!("Gagal membaca estimasi jumlah baris remote: {}", e))?;
-    let estimated_row_counts: HashMap<String, u64> = estimate_rows
-        .iter()
-        .filter_map(|row| {
-            let table_name = row.try_get::<String, _>("TABLE_NAME").ok()?;
-            let row_count = row.try_get::<i64, _>("estimated_rows").ok()?.max(0) as u64;
-            Some((table_name, row_count))
-        })
-        .collect();
-    let estimated_row_counts = Arc::new(estimated_row_counts);
-
     let local_connection_string = build_local_connection_string(&local_db_config);
     let local_schema_pool = MySqlPoolOptions::new()
         .max_connections(2)
@@ -859,6 +967,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let failures_c = failures_consumer.clone();
     let fatal_failure_c = fatal_failure.clone();
     let total_tables_c = total_tables;
+    let started_at_c = start_time;
 
     let consumer_handle = tokio::spawn(async move {
         let (mut local_child, mut local_stdin, mut local_stderr) =
@@ -910,6 +1019,8 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
         let mut total_rows_imported = 0usize;
         let mut completed_tables = 0usize;
+        let mut completed_table_names = HashSet::new();
+        let mut skipped_table_names = HashSet::new();
         let mut touched_tables = std::collections::HashSet::new();
         let mut stdin_failed = false;
 
@@ -1076,19 +1187,40 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         table_index,
                         total_tables_c,
                         completed_tables,
+                        &completed_table_names,
+                        &skipped_table_names,
                         &table_name,
                         if chunk_succeeded { row_count } else { 0 },
                         total_rows_imported,
                         "syncing",
+                        started_at_c,
+                        &failures_c,
                     );
                 }
                 PipelineMsg::TableFinished {
                     table_name,
                     table_index,
                     total_rows_synced,
+                    sync_data,
                 } => {
                     completed_tables += 1;
-                    if !table_has_failure(&failures_c, &table_name) {
+                    completed_table_names.insert(table_name.clone());
+                    let no_data_rows = table_has_no_data_to_sync(
+                        sync_data,
+                        total_rows_synced,
+                        table_has_failure(&failures_c, &table_name),
+                    );
+                    if no_data_rows {
+                        skipped_table_names.insert(table_name.clone());
+                        emit_log(
+                            &app_consumer,
+                            "info",
+                            format!(
+                                "[Tabel '{}'] Dilewati: tidak ada baris baru/perubahan untuk dikirim.",
+                                table_name
+                            ),
+                        );
+                    } else if !table_has_failure(&failures_c, &table_name) {
                         emit_log(
                             &app_consumer,
                             "info",
@@ -1104,10 +1236,14 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         table_index,
                         total_tables_c,
                         completed_tables,
+                        &completed_table_names,
+                        &skipped_table_names,
                         &table_name,
                         total_rows_synced,
                         total_rows_imported,
-                        "completed",
+                        if no_data_rows { "skipped" } else { "completed" },
+                        started_at_c,
+                        &failures_c,
                     );
                 }
                 PipelineMsg::TableSkipped {
@@ -1116,6 +1252,8 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                     reason,
                 } => {
                     completed_tables += 1;
+                    completed_table_names.insert(table_name.clone());
+                    skipped_table_names.insert(table_name.clone());
                     emit_log(
                         &app_consumer,
                         "info",
@@ -1126,10 +1264,14 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         table_index,
                         total_tables_c,
                         completed_tables,
+                        &completed_table_names,
+                        &skipped_table_names,
                         &table_name,
                         0,
                         total_rows_imported,
                         "skipped",
+                        started_at_c,
+                        &failures_c,
                     );
                 }
             }
@@ -1177,7 +1319,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             .map_err(|e| format!("Gagal mengambil keluaran error MySQL lokal: {}", e))?
             .map_err(|e| format!("Gagal membaca STDERR MySQL lokal: {}", e))?;
 
-        if !is_cancelled() && !status.success() {
+        if !is_cancelled() && (!status.success() || has_mysql_cli_errors(&stderr_output)) {
             let message = if stderr_output.is_empty() {
                 format!("Proses MySQL lokal berhenti dengan status {}", status)
             } else {
@@ -1204,7 +1346,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             }
         }
 
-        Ok((completed_tables, total_rows_imported))
+        Ok((
+            completed_tables,
+            total_rows_imported,
+            completed_table_names,
+            skipped_table_names,
+        ))
     });
 
     // ----------------------------------------------------
@@ -1223,7 +1370,6 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let app_c = app.clone();
         let failures_p = failures.clone();
         let tx_c = tx.clone();
-        let estimated_row_counts_c = estimated_row_counts.clone();
         let local_schema_pool_c = local_schema_pool.clone();
         let row_limit_opt = sync_options.row_limit;
 
@@ -1244,27 +1390,6 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 };
 
                 let table_name = &table_item.name;
-                if estimated_row_counts_c.get(table_name) == Some(&0) {
-                    if tx_c
-                        .send(PipelineMsg::TableSkipped {
-                            table_name: table_name.clone(),
-                            table_index: idx + 1,
-                            reason: "estimasi TABLE_ROWS 0".to_string(),
-                        })
-                        .await
-                        .is_err()
-                    {
-                        record_failure(
-                            &app_c,
-                            &failures_p,
-                            Some(table_name),
-                            "Melewati tabel dengan estimasi 0",
-                            "Worker impor lokal sudah berhenti",
-                        );
-                    }
-                    continue;
-                }
-
                 let safe_table = match sanitize_identifier(table_name) {
                     Ok(s) => s,
                     Err(e) => {
@@ -1691,6 +1816,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             table_name: table_name.clone(),
                             table_index: idx + 1,
                             total_rows_synced: total_table_rows,
+                            sync_data: table_item.sync_data,
                         })
                         .await
                         .is_err()
@@ -1710,6 +1836,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                             table_name: table_name.clone(),
                             table_index: idx + 1,
                             total_rows_synced: 0,
+                            sync_data: table_item.sync_data,
                         })
                         .await
                         .is_err()
@@ -1746,19 +1873,20 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     }
 
     // Wait for local consumer worker to finish writing all queued data
-    let (completed_table_count, total_rows_all_tables) = match consumer_handle.await {
-        Ok(Ok(res)) => res,
-        Ok(Err(e)) => {
-            fatal_failure.store(true, Ordering::SeqCst);
-            record_failure(&app, &failures, None, "Worker impor lokal", e);
-            (0, 0)
-        }
-        Err(e) => {
-            fatal_failure.store(true, Ordering::SeqCst);
-            record_failure(&app, &failures, None, "Worker impor lokal", e.to_string());
-            (0, 0)
-        }
-    };
+    let (completed_table_count, total_rows_all_tables, completed_table_names, skipped_table_names) =
+        match consumer_handle.await {
+            Ok(Ok(res)) => res,
+            Ok(Err(e)) => {
+                fatal_failure.store(true, Ordering::SeqCst);
+                record_failure(&app, &failures, None, "Worker impor lokal", e);
+                (0, 0, HashSet::new(), HashSet::new())
+            }
+            Err(e) => {
+                fatal_failure.store(true, Ordering::SeqCst);
+                record_failure(&app, &failures, None, "Worker impor lokal", e.to_string());
+                (0, 0, HashSet::new(), HashSet::new())
+            }
+        };
 
     let _ = remote_pool.close().await;
     local_schema_pool.close().await;
@@ -1787,6 +1915,23 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         all_tables_processed,
         !failures.is_empty(),
     );
+    let (processed_tables, successful_tables, failed_tables, skipped_tables) =
+        progress_table_counts(&completed_table_names, &skipped_table_names, &failures);
+
+    emit_progress(
+        &app,
+        completed_table_count,
+        total_tables,
+        completed_table_count,
+        &completed_table_names,
+        &skipped_table_names,
+        "",
+        0,
+        total_rows_all_tables,
+        status,
+        start_time,
+        &failures_consumer,
+    );
 
     let result = SyncResult {
         success: status == "success",
@@ -1794,6 +1939,10 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         total_tables: completed_table_count,
         total_rows_synced: total_rows_all_tables,
         duration_ms: duration.as_millis() as u64,
+        processed_tables,
+        successful_tables,
+        failed_tables,
+        skipped_tables,
         sync_timestamp: Some(sync_timestamp),
         sync_timestamp_epoch_ms: Some(sync_timestamp_epoch_ms),
         error: match status {
@@ -1858,7 +2007,76 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_chunk_where_clause, normalize_mysql_timestamp, resolve_sync_status};
+    use super::{
+        build_chunk_where_clause, has_mysql_cli_errors, normalize_mysql_timestamp,
+        progress_table_counts, resolve_sync_status, table_has_no_data_to_sync,
+        MysqlDumpRowCounter,
+    };
+    use crate::models::SyncFailure;
+    use std::collections::HashSet;
+
+    #[test]
+    fn mysql_dump_row_counter_handles_newlines_chunks_and_quoted_delimiters() {
+        let mut counter = MysqlDumpRowCounter::default();
+
+        counter.push(b"INSERT INTO `items` VALUES\n(1, 'contains ),( inside'),\n");
+        counter.push(b"(2, 'another row'); REPLACE INTO `items` VALUES (3, 'three');");
+
+        assert_eq!(counter.total_rows, 3);
+    }
+
+    #[test]
+    fn empty_incremental_table_is_skipped_but_failure_or_disabled_data_is_not() {
+        assert!(table_has_no_data_to_sync(true, 0, false));
+        assert!(!table_has_no_data_to_sync(true, 5, false));
+        assert!(!table_has_no_data_to_sync(true, 0, true));
+        assert!(!table_has_no_data_to_sync(false, 0, false));
+    }
+
+    #[test]
+    fn progress_counts_unique_failed_and_skipped_tables() {
+        let completed = ["customers", "orders", "empty_table"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let skipped = ["empty_table"].into_iter().map(str::to_string).collect();
+        let failures = vec![
+            SyncFailure {
+                table_name: Some("orders".to_string()),
+                stage: "Dump SSH".to_string(),
+                message: "connection lost".to_string(),
+            },
+            SyncFailure {
+                table_name: Some("orders".to_string()),
+                stage: "Importer MySQL lokal".to_string(),
+                message: "import failed".to_string(),
+            },
+            SyncFailure {
+                table_name: None,
+                stage: "SSH".to_string(),
+                message: "connection lost".to_string(),
+            },
+        ];
+
+        assert_eq!(
+            progress_table_counts(&completed, &skipped, &failures),
+            (3, 1, 1, 1)
+        );
+        assert_eq!(
+            progress_table_counts(&HashSet::new(), &HashSet::new(), &failures),
+            (1, 0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn mysql_cli_errors_are_detected_without_treating_warnings_as_failures() {
+        assert!(has_mysql_cli_errors(
+            "ERROR 1054 (42S22) at line 10: Unknown column"
+        ));
+        assert!(has_mysql_cli_errors(" ERROR: connection lost"));
+        assert!(!has_mysql_cli_errors("Warning: using a password on the command line"));
+        assert!(!has_mysql_cli_errors(""));
+    }
 
     #[test]
     fn sync_status_is_success_only_when_everything_finishes_cleanly() {
