@@ -44,6 +44,7 @@
         v-else-if="currentView === 'history'"
         :history-list="historyList"
         @clear-history="handleClearHistory"
+        @rerun-sync="handleRerunSync"
       />
     </main>
 
@@ -61,6 +62,20 @@
       @minimize="showSyncModal = false"
       @close="showSyncModal = false"
     />
+
+    <!-- Unobtrusive Floating Progress Widget when Modal Minimized -->
+    <MiniFloatingSyncWidget
+      v-if="!showSyncModal && (isSyncing || syncResult)"
+      :profile-name="activeProfile?.name || ''"
+      :progress="syncProgress"
+      :is-syncing="isSyncing"
+      :is-cancelling="isCancelling"
+      :result="syncResult"
+      :started-at="syncStartedAt"
+      @expand="showSyncModal = true"
+      @stop-sync="handleStopSync"
+      @dismiss="syncResult = null"
+    />
   </div>
 </template>
 
@@ -71,6 +86,7 @@ import TableView from './components/TableView.vue';
 import ProfileForm from './components/ProfileForm.vue';
 import HistoryView from './components/HistoryView.vue';
 import SyncProgressModal from './components/SyncProgressModal.vue';
+import MiniFloatingSyncWidget from './components/MiniFloatingSyncWidget.vue';
 
 import {
   getStoredProfiles,
@@ -327,6 +343,7 @@ async function handleStartSync(syncOptions) {
         throttle_ms: 60,
         sync_mode: syncOptions.sync_mode || 'incremental',
         incremental_watermarks: syncOptions.incremental_watermarks || null,
+        concurrency: syncOptions.concurrency || 2,
       },
     });
 
@@ -361,12 +378,24 @@ async function handleStartSync(syncOptions) {
 
       const newEntry = {
         profile_name: syncingProfile.name || 'database',
+        profile_id: syncingProfile.id,
         status: historyStatus(status),
         tables_count: res.total_tables || 0,
         rows_copied: res.total_rows_synced || 0,
         duration_text: durText,
+        table_names: selectedTables,
+        failures: res.failures || [],
+        mode: syncOptions.sync_mode || 'incremental',
+        row_limit: syncOptions.row_limit,
       };
       historyList.value = addHistoryEntry(newEntry);
+
+      if ('Notification' in window && Notification.permission === 'granted') {
+        const notifBody = status === 'success'
+          ? `Sinkronisasi '${syncingProfile.name}' selesai (${res.total_tables || 0} tabel, ${res.total_rows_synced || 0} baris).`
+          : `Sinkronisasi '${syncingProfile.name}' ${status} (${res.total_rows_synced || 0} baris tersalin).`;
+        new Notification('DB-Sync-Ssh', { body: notifBody });
+      }
 
       if (status === 'success' || status === 'partial') {
         const failedTableNames = new Set(
@@ -419,15 +448,66 @@ async function handleStartSync(syncOptions) {
     });
     historyList.value = addHistoryEntry({
       profile_name: syncingProfile.name || 'database',
+      profile_id: syncingProfile.id,
       status: 'Failed',
-      tables_count: 0,
+      tables_count: selectedTables.length,
       rows_copied: 0,
       duration_text: '—',
+      table_names: selectedTables,
+      failures: [{ stage: 'Koneksi / Sync', message: String(err) }],
+      mode: syncOptions.sync_mode || 'incremental',
+      row_limit: syncOptions.row_limit,
     });
+    if ('Notification' in window && Notification.permission === 'granted') {
+      new Notification('DB-Sync-Ssh', { body: `Sinkronisasi '${syncingProfile.name}' gagal: ${err}` });
+    }
   } finally {
     isSyncing.value = false;
     isCancelling.value = false;
   }
+}
+
+async function handleRerunSync(historyItem) {
+  if (isSyncing.value) return;
+
+  if (historyItem.profile_id && profiles.value.some((p) => p.id === historyItem.profile_id)) {
+    activeProfileId.value = historyItem.profile_id;
+    setActiveProfileId(historyItem.profile_id);
+    refreshLocalTableStates();
+    await fetchTables();
+  }
+  currentView.value = 'tables';
+
+  const tablesToSync = (historyItem.table_names || []).map((name) => ({
+    name,
+    sync_structure: true,
+    sync_data: true,
+  }));
+
+  if (tablesToSync.length === 0) return;
+
+  const watermarks = {};
+  if (historyItem.mode !== 'fresh') {
+    const states = getAllTableStates(activeProfileId.value);
+    for (const t of tablesToSync) {
+      const st = states[t.name];
+      if (st?.lastSyncedId) {
+        watermarks[t.name] = {
+          primary_key: st.primaryKey || 'id',
+          last_id: String(st.lastSyncedId).trim(),
+          last_sync_time: st.lastSyncTime || null,
+        };
+      }
+    }
+  }
+
+  handleStartSync({
+    tables: tablesToSync,
+    row_limit: historyItem.row_limit || null,
+    sync_mode: historyItem.mode || 'incremental',
+    incremental_watermarks: historyItem.mode !== 'fresh' ? watermarks : null,
+    concurrency: 2,
+  });
 }
 
 function appendSyncLog(log) {
