@@ -1,13 +1,33 @@
 <template>
   <div class="modal-overlay" @click.self="$emit('minimize')">
     <div class="modal-content">
+      <!-- Modal Header -->
       <div class="modal-header">
-        <h2 class="modal-title">
-          {{ isFinished ? resultTitle : `Syncing ${profileName}...` }}
-        </h2>
-        <button class="btn-secondary" style="padding: 0.25rem 0.5rem;" @click="$emit('minimize')">
-          ✕
-        </button>
+        <div class="modal-title-group">
+          <h2 class="modal-title">
+            {{ isFinished ? resultTitle : `Syncing ${profileName}...` }}
+          </h2>
+          <span v-if="!isFinished" class="modal-badge-running">
+            <span class="live-pulse-dot"></span> Sedang Berjalan
+          </span>
+        </div>
+        <div class="modal-header-actions">
+          <button
+            class="modal-btn-header"
+            title="Minimize ke widget mengambang"
+            @click="$emit('minimize')"
+          >
+            <Minus :size="14" />
+            <span class="btn-label-hide-sm">Minimize</span>
+          </button>
+          <button
+            class="modal-btn-header"
+            :title="isFinished ? 'Tutup modal' : 'Minimize modal'"
+            @click="$emit('minimize')"
+          >
+            <X :size="14" />
+          </button>
+        </div>
       </div>
 
       <div class="modal-body">
@@ -66,44 +86,155 @@
           </div>
         </div>
 
-        <!-- Terminal Console -->
-        <div ref="terminalRef" class="terminal-console">
-          <div
-            v-for="(log, idx) in logs"
-            :key="idx"
-            class="log-entry"
-          >
-            <span class="log-time">[{{ log.timestamp }}]</span>
-            <span
-              :class="{
-                'log-msg-info': log.type === 'info',
-                'log-msg-success': log.type === 'success',
-                'log-msg-warning': log.type === 'warning' || log.type === 'warn',
-                'log-msg-error': log.type === 'error'
-              }"
+        <!-- Terminal Console Toolbar (Filter Tabs & Search & Copy) -->
+        <div class="terminal-toolbar">
+          <div class="terminal-tabs">
+            <button
+              type="button"
+              class="terminal-tab"
+              :class="{ active: activeLogFilter === 'all' }"
+              @click="activeLogFilter = 'all'"
             >
+              Semua ({{ logs.length }})
+            </button>
+            <button
+              v-if="errorLogCount > 0"
+              type="button"
+              class="terminal-tab tab-error"
+              :class="{ active: activeLogFilter === 'error' }"
+              @click="activeLogFilter = 'error'"
+            >
+              Error ({{ errorLogCount }})
+            </button>
+            <button
+              v-if="warningLogCount > 0"
+              type="button"
+              class="terminal-tab tab-warning"
+              :class="{ active: activeLogFilter === 'warning' }"
+              @click="activeLogFilter = 'warning'"
+            >
+              Warning ({{ warningLogCount }})
+            </button>
+            <button
+              v-if="successLogCount > 0"
+              type="button"
+              class="terminal-tab tab-success"
+              :class="{ active: activeLogFilter === 'success' }"
+              @click="activeLogFilter = 'success'"
+            >
+              Berhasil ({{ successLogCount }})
+            </button>
+          </div>
+
+          <div class="terminal-actions">
+            <!-- Search within logs -->
+            <div class="terminal-search-box">
+              <Search :size="12" class="terminal-search-icon" />
+              <input
+                ref="logSearchInputRef"
+                v-model="logSearchQuery"
+                type="text"
+                placeholder="Cari log... (Ctrl+F)"
+                class="terminal-search-input"
+              />
               <button
-                v-if="log.details"
+                v-if="logSearchQuery"
                 type="button"
-                class="log-detail-toggle"
+                class="terminal-search-clear"
+                title="Hapus pencarian"
+                @click="logSearchQuery = ''"
+              >
+                ✕
+              </button>
+            </div>
+
+            <!-- Copy logs button -->
+            <button
+              type="button"
+              class="terminal-action-btn"
+              :title="copiedLogs ? 'Berhasil disalin ke clipboard!' : 'Salin seluruh log ke clipboard'"
+              @click="copyAllLogs"
+            >
+              <Check v-if="copiedLogs" :size="12" style="color: #10b981;" />
+              <Copy v-else :size="12" />
+              <span>{{ copiedLogs ? 'Tersalin!' : 'Salin Log' }}</span>
+            </button>
+
+            <!-- Export logs button -->
+            <button
+              type="button"
+              class="terminal-action-btn"
+              :title="exportedLogs ? 'Berhasil diekspor ke file!' : 'Ekspor log ke file .txt (Ctrl+S)'"
+              @click="exportLogsToFile"
+            >
+              <Check v-if="exportedLogs" :size="12" style="color: #10b981;" />
+              <Download v-else :size="12" />
+              <span>{{ exportedLogs ? 'Terekspor!' : 'Ekspor .txt' }}</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- Terminal Console Container with Scroll-lock and Jump-to-bottom button -->
+        <div class="terminal-wrapper">
+          <div
+            ref="terminalRef"
+            class="terminal-console"
+            @scroll="onTerminalScroll"
+          >
+            <div
+              v-for="(log, idx) in filteredLogs"
+              :key="getLogKey(log, idx)"
+              class="log-entry"
+            >
+              <span class="log-time">[{{ log.timestamp }}]</span>
+              <span
                 :class="{
                   'log-msg-info': log.type === 'info',
                   'log-msg-success': log.type === 'success',
                   'log-msg-warning': log.type === 'warning' || log.type === 'warn',
                   'log-msg-error': log.type === 'error'
                 }"
-                :aria-expanded="isLogExpanded(log, idx)"
-                @click="toggleLog(idx)"
               >
-                {{ log.message }} {{ isLogExpanded(log, idx) ? '▾' : '▸' }}
-              </button>
-              <span v-else>{{ log.message }}</span>
-            </span>
-            <pre v-if="log.details && isLogExpanded(log, idx)" class="log-detail-content">{{ log.details }}</pre>
+                <button
+                  v-if="log.details"
+                  type="button"
+                  class="log-detail-toggle"
+                  :class="{
+                    'log-msg-info': log.type === 'info',
+                    'log-msg-success': log.type === 'success',
+                    'log-msg-warning': log.type === 'warning' || log.type === 'warn',
+                    'log-msg-error': log.type === 'error'
+                  }"
+                  :aria-expanded="isLogExpanded(log, idx)"
+                  @click="toggleLog(log, idx)"
+                >
+                  {{ log.message }} {{ isLogExpanded(log, idx) ? '▾' : '▸' }}
+                </button>
+                <span v-else>{{ log.message }}</span>
+              </span>
+              <pre v-if="log.details && isLogExpanded(log, idx)" class="log-detail-content">{{ log.details }}</pre>
+            </div>
+            <div v-if="filteredLogs.length === 0" class="log-empty-state">
+              <span v-if="logSearchQuery || activeLogFilter !== 'all'">
+                Tidak ada log yang cocok dengan filter "{{ activeLogFilter !== 'all' ? activeLogFilter : logSearchQuery }}".
+              </span>
+              <span v-else style="color: #64748b; font-style: italic;">
+                Menunggu log dari engine sinkronisasi...
+              </span>
+            </div>
           </div>
-          <div v-if="logs.length === 0" style="color: #64748b; font-style: italic;">
-            Menunggu log dari engine sinkronisasi...
-          </div>
+
+          <!-- Floating button to jump down if user scrolled up -->
+          <button
+            v-if="!isAutoScrollEnabled && logs.length > 0"
+            type="button"
+            class="terminal-scroll-bottom-btn"
+            title="Klik untuk kembali ke log paling bawah"
+            @click="scrollToBottom"
+          >
+            <ArrowDown :size="12" />
+            <span>Scroll ke bawah</span>
+          </button>
         </div>
       </div>
 
@@ -132,6 +263,15 @@
 
 <script setup>
 import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from 'vue';
+import {
+  Minus,
+  X,
+  Search,
+  Copy,
+  Check,
+  ArrowDown,
+  Download,
+} from 'lucide-vue-next';
 
 const props = defineProps({
   profileName: {
@@ -179,14 +319,50 @@ const props = defineProps({
   },
 });
 
-defineEmits(['stop-sync', 'minimize', 'close']);
+const emit = defineEmits(['stop-sync', 'minimize', 'close']);
 
 const terminalRef = ref(null);
+const logSearchInputRef = ref(null);
 const expandedLogs = ref(new Set());
 const collapsedLogs = ref(new Set());
 const currentTime = ref(Date.now());
 const localStartedAt = Date.now();
 let elapsedTimer;
+
+const activeLogFilter = ref('all'); // 'all' | 'error' | 'warning' | 'success'
+const logSearchQuery = ref('');
+const copiedLogs = ref(false);
+const exportedLogs = ref(false);
+const isAutoScrollEnabled = ref(true);
+
+const errorLogCount = computed(() => props.logs.filter((l) => l.type === 'error').length);
+const warningLogCount = computed(() => props.logs.filter((l) => l.type === 'warning' || l.type === 'warn').length);
+const successLogCount = computed(() => props.logs.filter((l) => l.type === 'success').length);
+
+const filteredLogs = computed(() => {
+  let list = props.logs;
+  if (activeLogFilter.value === 'error') {
+    list = list.filter((l) => l.type === 'error');
+  } else if (activeLogFilter.value === 'warning') {
+    list = list.filter((l) => l.type === 'warning' || l.type === 'warn');
+  } else if (activeLogFilter.value === 'success') {
+    list = list.filter((l) => l.type === 'success');
+  }
+
+  const q = logSearchQuery.value.trim().toLowerCase();
+  if (q) {
+    list = list.filter((l) =>
+      (l.message && l.message.toLowerCase().includes(q)) ||
+      (l.details && l.details.toLowerCase().includes(q)) ||
+      (l.table_name && l.table_name.toLowerCase().includes(q))
+    );
+  }
+  return list;
+});
+
+function getLogKey(log, idx) {
+  return `${log.timestamp}-${log.type}-${log.message?.substring(0, 20)}-${idx}`;
+}
 
 const resultTitle = computed(() => {
   switch (props.result?.status) {
@@ -273,25 +449,134 @@ const elapsedMilliseconds = computed(() => {
 
 const elapsedLabel = computed(() => formatDuration(elapsedMilliseconds.value));
 
-function toggleLog(index) {
-  const log = props.logs[index];
-  const updated = new Set(log?.type === 'error' ? collapsedLogs.value : expandedLogs.value);
-  const currentlyExpanded = isLogExpanded(log, index);
+function toggleLog(log, idx) {
+  const key = getLogKey(log, idx);
+  const isErr = log?.type === 'error';
+  const updated = new Set(isErr ? collapsedLogs.value : expandedLogs.value);
+  const currentlyExpanded = isLogExpanded(log, idx);
 
-  if (log?.type === 'error') {
-    if (currentlyExpanded) updated.add(index);
-    else updated.delete(index);
+  if (isErr) {
+    if (currentlyExpanded) updated.add(key);
+    else updated.delete(key);
     collapsedLogs.value = updated;
   } else {
-    if (currentlyExpanded) updated.delete(index);
-    else updated.add(index);
+    if (currentlyExpanded) updated.delete(key);
+    else updated.add(key);
     expandedLogs.value = updated;
   }
 }
 
-function isLogExpanded(log, index) {
-  if (log?.type === 'error') return !collapsedLogs.value.has(index);
-  return expandedLogs.value.has(index);
+function isLogExpanded(log, idx) {
+  const key = getLogKey(log, idx);
+  if (log?.type === 'error') return !collapsedLogs.value.has(key);
+  return expandedLogs.value.has(key);
+}
+
+function onTerminalScroll() {
+  if (!terminalRef.value) return;
+  const { scrollTop, scrollHeight, clientHeight } = terminalRef.value;
+  // If user scrolled up more than 35px from bottom, pause auto-scroll
+  isAutoScrollEnabled.value = scrollHeight - scrollTop - clientHeight < 35;
+}
+
+function scrollToBottom() {
+  if (terminalRef.value) {
+    terminalRef.value.scrollTop = terminalRef.value.scrollHeight;
+    isAutoScrollEnabled.value = true;
+  }
+}
+
+async function copyAllLogs() {
+  if (!props.logs || props.logs.length === 0) return;
+  const text = props.logs
+    .map((l) => {
+      let str = `[${l.timestamp}] [${(l.type || 'INFO').toUpperCase()}] ${l.message}`;
+      if (l.details) {
+        str += `\n  ${l.details.split('\n').join('\n  ')}`;
+      }
+      return str;
+    })
+    .join('\n');
+
+  try {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      document.body.appendChild(ta);
+      ta.select();
+      document.execCommand('copy');
+      document.body.removeChild(ta);
+    }
+    copiedLogs.value = true;
+    setTimeout(() => {
+      copiedLogs.value = false;
+    }, 2000);
+  } catch (err) {
+    console.error('Failed to copy logs:', err);
+  }
+}
+
+function exportLogsToFile() {
+  if (!props.logs || props.logs.length === 0) return;
+  const header =
+    `========================================================\n` +
+    ` DB-Sync-Ssh - Synchronization Log Export\n` +
+    ` Profile   : ${props.profileName}\n` +
+    ` Exported  : ${new Date().toLocaleString('id-ID')}\n` +
+    ` Status    : ${props.result?.status || (props.isFinished ? 'Finished' : 'Running')}\n` +
+    ` Tables    : ${processedTableCount.value}/${props.progress.total_tables || 0}\n` +
+    ` Rows      : ${formatNumber(props.progress.total_synced_all_tables || 0)}\n` +
+    ` Duration  : ${elapsedLabel.value}\n` +
+    `========================================================\n\n`;
+
+  const body = props.logs
+    .map((l) => {
+      let str = `[${l.timestamp}] [${(l.type || 'INFO').toUpperCase()}] ${l.message}`;
+      if (l.details) {
+        str += `\n  Details:\n  ${l.details.split('\n').join('\n  ')}`;
+      }
+      return str;
+    })
+    .join('\n');
+
+  const fullContent = header + body;
+  const blob = new Blob([fullContent], { type: 'text/plain;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const safeProfile = (props.profileName || 'sync').toLowerCase().replace(/[^a-z0-9]/g, '_');
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+  a.href = url;
+  a.download = `db_sync_${safeProfile}_${timestamp}.txt`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+
+  exportedLogs.value = true;
+  setTimeout(() => {
+    exportedLogs.value = false;
+  }, 2000);
+}
+
+function onModalKeyDown(e) {
+  if (e.key === 'Escape') {
+    if (props.isFinished) {
+      emit('close');
+    } else {
+      emit('minimize');
+    }
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+    e.preventDefault();
+    if (logSearchInputRef.value) {
+      logSearchInputRef.value.focus();
+      logSearchInputRef.value.select();
+    }
+  } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') {
+    e.preventDefault();
+    exportLogsToFile();
+  }
 }
 
 const percentComplete = computed(() => {
@@ -318,19 +603,267 @@ onMounted(() => {
   elapsedTimer = window.setInterval(() => {
     currentTime.value = Date.now();
   }, 250);
+  window.addEventListener('keydown', onModalKeyDown);
 });
 
 onBeforeUnmount(() => {
   window.clearInterval(elapsedTimer);
+  window.removeEventListener('keydown', onModalKeyDown);
 });
 
 watch(
   () => props.logs.length,
   async () => {
-    await nextTick();
-    if (terminalRef.value) {
-      terminalRef.value.scrollTop = terminalRef.value.scrollHeight;
+    if (isAutoScrollEnabled.value) {
+      await nextTick();
+      if (terminalRef.value) {
+        terminalRef.value.scrollTop = terminalRef.value.scrollHeight;
+      }
     }
   }
 );
 </script>
+
+<style scoped>
+.modal-title-group {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.modal-badge-running {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background-color: var(--primary-green-light);
+  color: var(--primary-green);
+  border: 1px solid rgba(var(--primary-green-rgb), 0.2);
+  padding: 2px 8px;
+  border-radius: 9999px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+}
+
+.live-pulse-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background-color: #10b981;
+  animation: pulseGreen 1.5s infinite;
+}
+
+@keyframes pulseGreen {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+
+.modal-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.modal-btn-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background-color: #f1f5f9;
+  border: 1px solid #cbd5e1;
+  border-radius: var(--radius-sm);
+  padding: 0.3125rem 0.5rem;
+  font-size: 0.71875rem;
+  font-weight: 500;
+  color: #475569;
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.modal-btn-header:hover {
+  background-color: #e2e8f0;
+  color: #0f172a;
+}
+
+@media (max-width: 600px) {
+  .btn-label-hide-sm {
+    display: none;
+  }
+}
+
+/* Terminal Toolbar */
+.terminal-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 1rem;
+  margin-bottom: 0.375rem;
+  flex-wrap: wrap;
+}
+
+.terminal-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.terminal-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #64748b;
+  font-size: 0.71875rem;
+  font-weight: 500;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.terminal-tab:hover {
+  background: #f1f5f9;
+  color: #0f172a;
+}
+
+.terminal-tab.active {
+  background: #0b1120;
+  color: #f8fafc;
+  font-weight: 600;
+}
+
+.terminal-tab.tab-error {
+  color: #ef4444;
+}
+
+.terminal-tab.tab-error.active {
+  background: #991b1b;
+  color: #ffffff;
+}
+
+.terminal-tab.tab-warning {
+  color: #d97706;
+}
+
+.terminal-tab.tab-warning.active {
+  background: #b45309;
+  color: #ffffff;
+}
+
+.terminal-tab.tab-success {
+  color: #059669;
+}
+
+.terminal-tab.tab-success.active {
+  background: #065f46;
+  color: #ffffff;
+}
+
+.terminal-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.terminal-search-box {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  width: 140px;
+}
+
+.terminal-search-icon {
+  position: absolute;
+  left: 6px;
+  color: #94a3b8;
+  pointer-events: none;
+}
+
+.terminal-search-input {
+  width: 100%;
+  padding: 3px 18px 3px 22px;
+  font-size: 0.71875rem;
+  border: 1px solid #cbd5e1;
+  border-radius: var(--radius-sm);
+  background: #ffffff;
+  color: #0f172a;
+  outline: none;
+}
+
+.terminal-search-input:focus {
+  border-color: var(--primary-green);
+}
+
+.terminal-search-clear {
+  position: absolute;
+  right: 4px;
+  background: transparent;
+  border: none;
+  color: #94a3b8;
+  font-size: 10px;
+  cursor: pointer;
+  padding: 2px;
+}
+
+.terminal-action-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font-size: 0.71875rem;
+  font-weight: 500;
+  border: 1px solid #cbd5e1;
+  background: #ffffff;
+  color: #475569;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.terminal-action-btn:hover {
+  background: #f8fafc;
+  color: #0f172a;
+  border-color: #94a3b8;
+}
+
+/* Terminal Wrapper */
+.terminal-wrapper {
+  position: relative;
+  width: 100%;
+}
+
+.terminal-scroll-bottom-btn {
+  position: absolute;
+  bottom: 12px;
+  right: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: #1e293b;
+  color: #f8fafc;
+  border: 1px solid #475569;
+  border-radius: 9999px;
+  padding: 4px 10px;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  cursor: pointer;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+  animation: bounceSoft 1s infinite alternate;
+  z-index: 10;
+}
+
+.terminal-scroll-bottom-btn:hover {
+  background: #334155;
+}
+
+@keyframes bounceSoft {
+  from { transform: translateY(0); }
+  to { transform: translateY(-3px); }
+}
+
+.log-empty-state {
+  padding: 2rem 1rem;
+  text-align: center;
+  color: #94a3b8;
+  font-size: 0.78125rem;
+  font-style: italic;
+}
+</style>

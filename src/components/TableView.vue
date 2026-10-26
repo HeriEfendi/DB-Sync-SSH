@@ -33,11 +33,37 @@
               class="search-input"
               placeholder="Search tables... (Ctrl+F)"
             />
+            <button
+              v-if="searchQuery"
+              type="button"
+              class="search-clear-btn"
+              title="Clear search (Esc)"
+              @click="clearSearch"
+            >
+              ✕
+            </button>
           </div>
 
           <div class="selection-actions">
-            <button class="btn-chip" title="Select all filtered tables" @click="handleSelectAll">Select All</button>
+            <button class="btn-chip" title="Pilih semua tabel hasil filter (Ctrl+A)" @click="handleSelectAll">Select All</button>
             <button class="btn-chip" title="Clear all selection" @click="handleClearAll">Clear</button>
+          </div>
+
+          <div class="filter-chips-group">
+            <button
+              class="filter-chip"
+              :class="{ active: smartFilter === 'all' }"
+              @click="smartFilter = 'all'"
+            >
+              All
+            </button>
+            <button
+              class="filter-chip"
+              :class="{ active: smartFilter === 'selected' }"
+              @click="smartFilter = 'selected'"
+            >
+              Selected ({{ selectedCount }})
+            </button>
           </div>
         </div>
 
@@ -123,9 +149,58 @@
               placeholder="Jml baris"
             />
           </div>
+
+          <div class="row-limit-wrapper">
+            <span class="control-label">Workers:</span>
+            <select
+              v-model.number="concurrencyWorkers"
+              class="limit-select"
+              title="Jumlah worker download SSH paralel (1-4)"
+            >
+              <option :value="1">1 Worker</option>
+              <option :value="2">2 Workers</option>
+              <option :value="3">3 Workers</option>
+              <option :value="4">4 Workers</option>
+            </select>
+          </div>
+
+          <div class="row-limit-wrapper">
+            <span class="control-label">Auto:</span>
+            <select
+              v-model.number="autoSyncIntervalMinutes"
+              class="limit-select"
+              title="Sinkronisasi otomatis di latar belakang"
+              @change="handleAutoSyncChange"
+            >
+              <option :value="0">Off (Manual)</option>
+              <option :value="5">Tiap 5 Menit</option>
+              <option :value="15">Tiap 15 Menit</option>
+              <option :value="30">Tiap 30 Menit</option>
+              <option :value="60">Tiap 1 Jam</option>
+              <option :value="120">Tiap 2 Jam</option>
+            </select>
+            <span
+              v-if="autoSyncIntervalMinutes > 0"
+              class="auto-sync-countdown-badge"
+              :title="`Sync otomatis berjalan setiap ${autoSyncIntervalMinutes} menit`"
+            >
+              ⏱️ {{ autoSyncCountdownText }}
+            </span>
+          </div>
         </div>
 
         <div class="toolbar-right">
+          <button
+            type="button"
+            class="btn-secondary"
+            :disabled="isLoadingTables || isSyncing || isComparingDiff"
+            title="Bandingkan baris tabel remote vs lokal sebelum sync"
+            @click="openDiffInspector"
+          >
+            <GitCompare :size="13" :class="{ 'spin-anim': isComparingDiff }" />
+            <span>Compare Diff</span>
+          </button>
+
           <button
             class="btn-refresh"
             :disabled="isLoadingTables"
@@ -138,6 +213,7 @@
           <button
             class="btn-primary"
             :disabled="selectedCount === 0 || isSyncing"
+            :title="selectedCount > 0 ? 'Mulai sinkronisasi tabel terpilih (Shortcut: Ctrl+Enter)' : 'Pilih minimal 1 tabel untuk sync'"
             @click="startSync"
           >
             <Play :size="13" />
@@ -149,7 +225,11 @@
 
     <!-- Table Card with Fixed Header and Scrollable Body -->
     <div class="table-card">
-      <div class="table-scroll-container">
+      <div
+        ref="tableContainerRef"
+        class="table-scroll-container"
+        @scroll.passive="handleScroll"
+      >
         <table class="data-table">
           <thead>
             <tr>
@@ -166,11 +246,22 @@
               <th class="col-last-id">Last ID</th>
               <th class="col-last-sync">Last Sync</th>
               <th class="col-sync-mode">Sync Mode</th>
+              <th class="col-action">Action</th>
             </tr>
           </thead>
           <tbody>
+            <!-- Top virtual scroll spacer row -->
             <tr
-              v-for="tbl in filteredTables"
+              v-if="topSpacerHeight > 0"
+              class="virtual-spacer-row"
+              :style="{ height: `${topSpacerHeight}px` }"
+              aria-hidden="true"
+            >
+              <td colspan="6" style="padding: 0; border: none; height: inherit; pointer-events: none; background: transparent;"></td>
+            </tr>
+
+            <tr
+              v-for="tbl in visibleTables"
               :key="tbl.name"
               :class="{
                 'row-selected': tableStates[tbl.name]?.selected,
@@ -238,9 +329,32 @@
                   </label>
                 </div>
               </td>
+              <td class="col-action">
+                <button
+                  type="button"
+                  class="btn-quick-sync"
+                  :title="`Sync instan tabel '${tbl.name}' sekarang`"
+                  :disabled="isSyncing"
+                  @click.stop="quickSyncTable(tbl.name)"
+                >
+                  <Zap :size="11" />
+                  <span>Sync</span>
+                </button>
+              </td>
             </tr>
+
+            <!-- Bottom virtual scroll spacer row -->
+            <tr
+              v-if="bottomSpacerHeight > 0"
+              class="virtual-spacer-row"
+              :style="{ height: `${bottomSpacerHeight}px` }"
+              aria-hidden="true"
+            >
+              <td colspan="6" style="padding: 0; border: none; height: inherit; pointer-events: none; background: transparent;"></td>
+            </tr>
+
             <tr v-if="filteredTables.length === 0">
-              <td colspan="5" class="empty-state-cell">
+              <td colspan="6" class="empty-state-cell">
                 <span v-if="isLoadingTables">Memuat daftar tabel remote...</span>
                 <span v-else>Tidak ada tabel yang cocok dengan pencarian atau koneksi belum dimuat.</span>
               </td>
@@ -253,12 +367,25 @@
         <span>Terpilih: <strong style="color: var(--primary-green)">{{ selectedCount }}</strong> dari {{ tables.length }} tabel</span>
       </div>
     </div>
+
+    <!-- Table Diff Modal -->
+    <TableDiffModal
+      v-if="showDiffModal"
+      :diff-list="diffResults"
+      :is-loading="isComparingDiff"
+      :profile-name="profile.name"
+      @close="showDiffModal = false"
+      @select-diverged="handleSelectDiverged"
+      @sync-diverged="handleSyncDiverged"
+    />
   </div>
 </template>
 
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
-import { Database, Search, RotateCw, Play, Settings } from 'lucide-vue-next';
+import { Database, Search, RotateCw, Play, Settings, Zap, GitCompare } from 'lucide-vue-next';
+import TableDiffModal from './TableDiffModal.vue';
+import { safeInvoke } from '../services/tauriHelper.js';
 import {
   getLastSelectedRowLimit,
   getLastSelectedTemplateId,
@@ -317,6 +444,16 @@ const customRowLimit = ref(initialRowLimit.custom);
 // Per-table state: { selected: bool, sync_structure: bool, sync_data: bool }
 const tableStates = ref({});
 
+const smartFilter = ref('all'); // 'all' | 'selected'
+const concurrencyWorkers = ref(2);
+const autoSyncIntervalMinutes = ref(0);
+const autoSyncRemainingSeconds = ref(0);
+let autoSyncIntervalTimer = null;
+
+const showDiffModal = ref(false);
+const isComparingDiff = ref(false);
+const diffResults = ref([]);
+
 watch(
   () => props.profile.id,
   () => {
@@ -325,7 +462,16 @@ watch(
     const rowLimit = getLastSelectedRowLimit(props.profile.id);
     rowLimitPreset.value = rowLimit.preset;
     customRowLimit.value = rowLimit.custom;
-  }
+
+    const storedAuto = parseInt(localStorage.getItem(`db_sync_auto_${props.profile.id}`), 10);
+    autoSyncIntervalMinutes.value = !isNaN(storedAuto) && storedAuto > 0 ? storedAuto : 0;
+    if (autoSyncIntervalMinutes.value > 0) {
+      startAutoSyncTimer();
+    } else {
+      stopAutoSyncTimer();
+    }
+  },
+  { immediate: true }
 );
 
 watch(
@@ -360,11 +506,93 @@ watch(
 );
 
 const filteredTables = computed(() => {
-  if (!searchQuery.value.trim()) {
-    return props.tables;
+  let list = props.tables;
+
+  // 1. Filter: All vs Selected Only
+  if (smartFilter.value === 'selected') {
+    list = list.filter((tbl) => tableStates.value[tbl.name]?.selected);
   }
-  const q = searchQuery.value.toLowerCase().trim();
-  return props.tables.filter((tbl) => tbl.name.toLowerCase().includes(q));
+
+  // 2. Search query (supports !negation and regex)
+  const q = searchQuery.value.trim();
+  if (!q) return list;
+
+  if (q.startsWith('!')) {
+    const negTerm = q.substring(1).trim().toLowerCase();
+    if (negTerm) {
+      return list.filter((tbl) => !tbl.name.toLowerCase().includes(negTerm));
+    }
+  }
+
+  try {
+    const reg = new RegExp(q, 'i');
+    return list.filter((tbl) => reg.test(tbl.name));
+  } catch {
+    const low = q.toLowerCase();
+    return list.filter((tbl) => tbl.name.toLowerCase().includes(low));
+  }
+});
+
+// --- High-Performance Virtual Scrolling for 100 to 10,000+ Tables ---
+const tableContainerRef = ref(null);
+const scrollTop = ref(0);
+const containerHeight = ref(500);
+const ROW_HEIGHT = 32;
+const BUFFER_ITEMS = 15;
+
+const isVirtualScrollActive = computed(() => filteredTables.value.length > 50);
+
+const startIndex = computed(() => {
+  if (!isVirtualScrollActive.value) return 0;
+  const index = Math.floor(scrollTop.value / ROW_HEIGHT) - BUFFER_ITEMS;
+  return Math.max(0, index);
+});
+
+const endIndex = computed(() => {
+  const total = filteredTables.value.length;
+  if (!isVirtualScrollActive.value) return total;
+  const count = Math.ceil(containerHeight.value / ROW_HEIGHT) + 2 * BUFFER_ITEMS;
+  return Math.min(total, startIndex.value + count);
+});
+
+const visibleTables = computed(() => {
+  if (!isVirtualScrollActive.value) return filteredTables.value;
+  return filteredTables.value.slice(startIndex.value, endIndex.value);
+});
+
+const topSpacerHeight = computed(() => {
+  if (!isVirtualScrollActive.value) return 0;
+  return startIndex.value * ROW_HEIGHT;
+});
+
+const bottomSpacerHeight = computed(() => {
+  if (!isVirtualScrollActive.value) return 0;
+  const total = filteredTables.value.length;
+  return Math.max(0, (total - endIndex.value) * ROW_HEIGHT);
+});
+
+let scrollRafId = null;
+function handleScroll(e) {
+  if (scrollRafId) cancelAnimationFrame(scrollRafId);
+  scrollRafId = requestAnimationFrame(() => {
+    if (e.target) {
+      scrollTop.value = e.target.scrollTop;
+    }
+  });
+}
+
+function updateContainerHeight() {
+  if (tableContainerRef.value) {
+    containerHeight.value = tableContainerRef.value.clientHeight || 500;
+  }
+}
+
+// Reset scroll to top when search query or smart filter changes
+watch([searchQuery, smartFilter], () => {
+  if (tableContainerRef.value) {
+    tableContainerRef.value.scrollTop = 0;
+  }
+  scrollTop.value = 0;
 });
 
 const selectedCount = computed(() => {
@@ -598,25 +826,203 @@ function startSync() {
     row_limit: rowLimit,
     sync_mode: syncMode.value,
     incremental_watermarks: syncMode.value === 'incremental' ? watermarks : null,
+    concurrency: concurrencyWorkers.value,
   });
 }
 
+function clearSearch() {
+  searchQuery.value = '';
+  searchInputRef.value?.focus();
+}
+
+function quickSyncTable(tableName) {
+  if (props.isSyncing) return;
+
+  const s = tableStates.value[tableName] || {};
+  const selectedItems = [
+    {
+      name: tableName,
+      sync_structure: true,
+      sync_data: s.sync_data !== undefined ? Boolean(s.sync_data) : true,
+    },
+  ];
+
+  const watermarks = {};
+  const st = props.tableStatesMap[tableName];
+  const lastId =
+    st?.lastSyncedId === undefined || st?.lastSyncedId === null
+      ? ''
+      : String(st.lastSyncedId).trim();
+  if (/^[0-9]+$/.test(lastId) && /[1-9]/.test(lastId)) {
+    watermarks[tableName] = {
+      primary_key: st.primaryKey || 'id',
+      last_id: lastId,
+      last_sync_time: st.lastSyncTime || null,
+    };
+  }
+
+  let rowLimit = null;
+  if (rowLimitPreset.value === 'custom') {
+    const customNum = parseInt(customRowLimit.value, 10);
+    if (!isNaN(customNum) && customNum > 0) {
+      rowLimit = customNum;
+    }
+  } else if (typeof rowLimitPreset.value === 'number' && rowLimitPreset.value > 0) {
+    rowLimit = rowLimitPreset.value;
+  }
+
+  emit('start-sync', {
+    tables: selectedItems,
+    row_limit: rowLimit,
+    sync_mode: syncMode.value,
+    incremental_watermarks: syncMode.value === 'incremental' ? watermarks : null,
+    concurrency: 1,
+  });
+}
+
+// Diff Inspector methods
+async function openDiffInspector() {
+  if (isComparingDiff.value || props.isSyncing) return;
+  showDiffModal.value = true;
+  isComparingDiff.value = true;
+  diffResults.value = [];
+  try {
+    const res = await safeInvoke('compare_table_counts', {
+      sshConfig: props.profile.ssh,
+      remoteDbConfig: props.profile.remote_db,
+      localDbConfig: props.profile.local_db,
+      tables: props.tables.map((t) => t.name),
+    });
+    diffResults.value = Array.isArray(res) ? res : [];
+  } catch (err) {
+    console.error('Failed to compare table counts:', err);
+  } finally {
+    isComparingDiff.value = false;
+  }
+}
+
+function handleSelectDiverged(divergedNames) {
+  const nameSet = new Set(divergedNames);
+  for (const tbl of props.tables) {
+    if (tableStates.value[tbl.name]) {
+      tableStates.value[tbl.name].selected = nameSet.has(tbl.name);
+    }
+  }
+}
+
+function handleSyncDiverged(divergedNames) {
+  handleSelectDiverged(divergedNames);
+  startSync();
+}
+
+// Auto-Sync methods
+const autoSyncCountdownText = computed(() => {
+  const m = Math.floor(autoSyncRemainingSeconds.value / 60);
+  const s = autoSyncRemainingSeconds.value % 60;
+  return `${m}:${String(s).padStart(2, '0')}`;
+});
+
+function handleAutoSyncChange() {
+  localStorage.setItem(`db_sync_auto_${props.profile.id}`, String(autoSyncIntervalMinutes.value));
+  if (autoSyncIntervalMinutes.value > 0) {
+    if ('Notification' in window && Notification.permission === 'default') {
+      Notification.requestPermission();
+    }
+    startAutoSyncTimer();
+  } else {
+    stopAutoSyncTimer();
+  }
+}
+
+function startAutoSyncTimer() {
+  stopAutoSyncTimer();
+  if (autoSyncIntervalMinutes.value <= 0) return;
+  autoSyncRemainingSeconds.value = autoSyncIntervalMinutes.value * 60;
+  autoSyncIntervalTimer = setInterval(() => {
+    if (props.isSyncing) return; // Pause countdown while syncing
+    if (autoSyncRemainingSeconds.value > 0) {
+      autoSyncRemainingSeconds.value -= 1;
+    }
+    if (autoSyncRemainingSeconds.value <= 0) {
+      autoSyncRemainingSeconds.value = autoSyncIntervalMinutes.value * 60;
+      startSync();
+    }
+  }, 1000);
+}
+
+function stopAutoSyncTimer() {
+  if (autoSyncIntervalTimer) {
+    clearInterval(autoSyncIntervalTimer);
+    autoSyncIntervalTimer = null;
+  }
+}
+
 function onKeyDown(e) {
+  const isInputFocused = ['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName);
+
+  // 1. Ctrl+F / Cmd+F: Focus search input
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
     e.preventDefault();
     if (searchInputRef.value) {
       searchInputRef.value.focus();
       searchInputRef.value.select();
     }
+    return;
+  }
+
+  // 2. Ctrl+A / Cmd+A: Select all filtered tables (only when not editing an input)
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'a' && !isInputFocused) {
+    e.preventDefault();
+    handleSelectAll();
+    return;
+  }
+
+  // 3. Ctrl+Enter / Cmd+Enter: Trigger Start Sync
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    if (selectedCount.value > 0 && !props.isSyncing) {
+      e.preventDefault();
+      startSync();
+    }
+    return;
+  }
+
+  // 4. Escape: Close Diff modal or clear/blur search
+  if (e.key === 'Escape') {
+    if (showDiffModal.value) {
+      showDiffModal.value = false;
+      return;
+    }
+    if (document.activeElement === searchInputRef.value) {
+      if (searchQuery.value) {
+        searchQuery.value = '';
+      } else {
+        searchInputRef.value.blur();
+      }
+    }
   }
 }
 
+let resizeObserver = null;
+
 onMounted(() => {
   window.addEventListener('keydown', onKeyDown);
+  updateContainerHeight();
+  if (typeof ResizeObserver !== 'undefined' && tableContainerRef.value) {
+    resizeObserver = new ResizeObserver(() => {
+      updateContainerHeight();
+    });
+    resizeObserver.observe(tableContainerRef.value);
+  }
 });
 
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onKeyDown);
+  stopAutoSyncTimer();
+  if (scrollRafId) cancelAnimationFrame(scrollRafId);
+  if (resizeObserver) {
+    resizeObserver.disconnect();
+    resizeObserver = null;
+  }
 });
 </script>
 
@@ -627,5 +1033,68 @@ onBeforeUnmount(() => {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+.filter-chips-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  margin-left: 0.375rem;
+}
+
+.filter-chip {
+  background: transparent;
+  border: 1px solid transparent;
+  color: #64748b;
+  font-size: 0.6875rem;
+  font-weight: 500;
+  padding: 2px 7px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: all 0.15s ease;
+}
+
+.filter-chip:hover {
+  background-color: #e2e8f0;
+  color: #0f172a;
+}
+
+.filter-chip.active {
+  background-color: var(--primary-green-light);
+  border-color: rgba(var(--primary-green-rgb), 0.3);
+  color: var(--primary-green);
+  font-weight: 600;
+}
+
+.auto-sync-countdown-badge {
+  display: inline-flex;
+  align-items: center;
+  background-color: var(--primary-green-light);
+  color: var(--primary-green);
+  border: 1px solid rgba(var(--primary-green-rgb), 0.2);
+  border-radius: var(--radius-sm);
+  padding: 2px 6px;
+  font-size: 0.65625rem;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.virtual-spacer-row {
+  border: none !important;
+  background: transparent !important;
+  pointer-events: none;
+}
+
+.virtual-spacer-row td {
+  padding: 0 !important;
+  border: none !important;
+  line-height: 0 !important;
+  background: transparent !important;
+  pointer-events: none;
+}
+
+:deep(.data-table tr.virtual-spacer-row:hover) {
+  background-color: transparent !important;
 }
 </style>
