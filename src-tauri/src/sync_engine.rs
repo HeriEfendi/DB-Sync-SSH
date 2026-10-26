@@ -1618,7 +1618,28 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         total_rows_synced,
                         table_has_failure(&failures_c, &table_name),
                     );
-                    if no_data_rows {
+                    if !sync_data {
+                        if !touched_tables.contains(&table_name) {
+                            skipped_table_names.insert(table_name.clone());
+                        }
+                        if !table_has_failure(&failures_c, &table_name) {
+                            emit_log(
+                                &app_consumer,
+                                "info",
+                                if touched_tables.contains(&table_name) {
+                                    format!(
+                                        "[Tabel '{}'] Selesai: struktur tabel disinkronkan (opsi data dinonaktifkan).",
+                                        table_name
+                                    )
+                                } else {
+                                    format!(
+                                        "[Tabel '{}'] Dilewati: sinkronisasi data dinonaktifkan.",
+                                        table_name
+                                    )
+                                },
+                            );
+                        }
+                    } else if no_data_rows {
                         skipped_table_names.insert(table_name.clone());
                         emit_log(
                             &app_consumer,
@@ -1649,7 +1670,11 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         &table_name,
                         total_rows_synced,
                         total_rows_imported,
-                        if no_data_rows { "skipped" } else { "completed" },
+                        if (!sync_data && !touched_tables.contains(&table_name)) || no_data_rows {
+                            "skipped"
+                        } else {
+                            "completed"
+                        },
                         started_at_c,
                         &failures_c,
                     );

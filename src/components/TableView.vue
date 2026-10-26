@@ -245,7 +245,20 @@
               <th>Table Name</th>
               <th class="col-last-id">Last ID</th>
               <th class="col-last-sync">Last Sync</th>
-              <th class="col-sync-mode">Sync Mode</th>
+              <th class="col-sync-mode">
+                <div class="sync-mode-header-wrap">
+                  <span>Sync Mode</span>
+                  <label class="check-label-header" title="Toggle centang 'Data' untuk semua tabel terpilih">
+                    <input
+                      type="checkbox"
+                      :checked="isAllDataChecked"
+                      :indeterminate.prop="isDataIndeterminate"
+                      @change="toggleAllDataFiltered($event.target.checked)"
+                    />
+                    <span>Data</span>
+                  </label>
+                </div>
+              </th>
               <th class="col-action">Action</th>
             </tr>
           </thead>
@@ -643,28 +656,46 @@ function handleClearAll() {
   }
 }
 
-function setGlobalMode(mode) {
-  globalMode.value = mode;
-  Object.keys(tableStates.value).forEach((k) => {
-    const state = tableStates.value[k];
-    if (mode === 'both') {
-      state.sync_structure = true;
-      state.sync_data = state.selected;
-    } else {
-      state.sync_structure = true;
-      state.sync_data = false;
-    }
-  });
-}
-
 function setTableSelected(tableName, selected) {
   const state = tableStates.value[tableName];
   if (state) {
     state.selected = selected;
-    if (!selected) {
-      state.sync_data = false;
-    }
+    state.sync_data = selected;
   }
+}
+
+const isAllDataChecked = computed(() => {
+  const selectedFiltered = filteredTables.value.filter(
+    (tbl) => tableStates.value[tbl.name]?.selected
+  );
+  if (selectedFiltered.length === 0) return false;
+  return selectedFiltered.every((tbl) => tableStates.value[tbl.name]?.sync_data);
+});
+
+const isDataIndeterminate = computed(() => {
+  const selectedFiltered = filteredTables.value.filter(
+    (tbl) => tableStates.value[tbl.name]?.selected
+  );
+  if (selectedFiltered.length === 0) return false;
+  const count = selectedFiltered.filter((tbl) => tableStates.value[tbl.name]?.sync_data).length;
+  return count > 0 && count < selectedFiltered.length;
+});
+
+function toggleAllDataFiltered(checked) {
+  const hasSelected = filteredTables.value.some((tbl) => tableStates.value[tbl.name]?.selected);
+  filteredTables.value.forEach((tbl) => {
+    const s = tableStates.value[tbl.name];
+    if (s) {
+      if (hasSelected) {
+        if (s.selected) {
+          s.sync_data = checked;
+        }
+      } else if (checked) {
+        s.selected = true;
+        s.sync_data = true;
+      }
+    }
+  });
 }
 
 function toggleTableSelect(tableName, checked) {
@@ -793,7 +824,7 @@ function startSync() {
       selectedItems.push({
         name: tblName,
         sync_structure: true,
-        sync_data: Boolean(s.sync_data),
+        sync_data: s.sync_data !== undefined ? Boolean(s.sync_data) : true,
       });
 
       // Pass both row ID and the remote timestamp from the previous successful sync.
@@ -808,6 +839,16 @@ function startSync() {
           last_sync_time: st.lastSyncTime || null,
         };
       }
+    }
+  }
+
+  const tablesWithData = selectedItems.filter((item) => item.sync_data);
+  if (selectedItems.length > 0 && tablesWithData.length === 0) {
+    const confirmNoData = window.confirm(
+      `Perhatian: Seluruh tabel terpilih (${selectedItems.length}) tidak mengaktifkan opsi 'Data' (hanya struktur yang akan disinkronkan tanpa baris data).\n\nApakah Anda yakin ingin melanjutkan tanpa menyalin data?`
+    );
+    if (!confirmNoData) {
+      return;
     }
   }
 
@@ -904,9 +945,7 @@ async function openDiffInspector() {
 function handleSelectDiverged(divergedNames) {
   const nameSet = new Set(divergedNames);
   for (const tbl of props.tables) {
-    if (tableStates.value[tbl.name]) {
-      tableStates.value[tbl.name].selected = nameSet.has(tbl.name);
-    }
+    setTableSelected(tbl.name, nameSet.has(tbl.name));
   }
 }
 
@@ -1096,5 +1135,27 @@ onBeforeUnmount(() => {
 
 :deep(.data-table tr.virtual-spacer-row:hover) {
   background-color: transparent !important;
+}
+
+.sync-mode-header-wrap {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+}
+
+.check-label-header {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.6875rem;
+  font-weight: 600;
+  color: #475569;
+  cursor: pointer;
+  user-select: none;
+}
+
+.check-label-header:hover {
+  color: #0f172a;
 }
 </style>
