@@ -53,6 +53,7 @@
       :profile-name="activeProfile?.name || ''"
       :progress="syncProgress"
       :logs="syncLogs"
+      :started-at="syncStartedAt"
       :is-finished="!isSyncing"
       :result="syncResult"
       :is-cancelling="isCancelling"
@@ -99,6 +100,7 @@ const isLoadingTables = ref(false);
 
 const isSyncing = ref(false);
 const showSyncModal = ref(false);
+const syncStartedAt = ref(0);
 const syncLogs = ref([]);
 const syncResult = ref(null);
 const isCancelling = ref(false);
@@ -106,9 +108,16 @@ const syncProgress = ref({
   current_table_index: 0,
   total_tables: 0,
   completed_tables: 0,
+  completed_table_names: [],
+  skipped_table_names: [],
   current_table_name: '',
   rows_synced_current_table: 0,
   total_synced_all_tables: 0,
+  processed_tables: 0,
+  successful_tables: 0,
+  failed_tables: 0,
+  skipped_tables: 0,
+  elapsed_ms: 0,
   status: 'idle',
 });
 const historyList = ref([]);
@@ -285,6 +294,7 @@ async function handleStartSync(syncOptions) {
 
   isSyncing.value = true;
   showSyncModal.value = true;
+  syncStartedAt.value = Date.now();
   syncLogs.value = [];
   syncResult.value = null;
   const syncingProfile = activeProfile.value;
@@ -293,9 +303,16 @@ async function handleStartSync(syncOptions) {
     current_table_index: 0,
     total_tables: syncOptions.tables.length,
     completed_tables: 0,
+    completed_table_names: [],
+    skipped_table_names: [],
     current_table_name: syncOptions.tables[0]?.name || '',
     rows_synced_current_table: 0,
     total_synced_all_tables: 0,
+    processed_tables: 0,
+    successful_tables: 0,
+    failed_tables: 0,
+    skipped_tables: 0,
+    elapsed_ms: 0,
     status: 'starting',
   };
 
@@ -316,7 +333,17 @@ async function handleStartSync(syncOptions) {
     if (res) {
       const status = res.status || (res.success ? 'success' : 'failed');
       syncResult.value = { ...res, status };
-      syncProgress.value = { ...syncProgress.value, status };
+      syncProgress.value = {
+        ...syncProgress.value,
+        current_table_name: '',
+        rows_synced_current_table: 0,
+        processed_tables: res.processed_tables ?? syncProgress.value.processed_tables,
+        successful_tables: res.successful_tables ?? syncProgress.value.successful_tables,
+        failed_tables: res.failed_tables ?? syncProgress.value.failed_tables,
+        skipped_tables: res.skipped_tables ?? syncProgress.value.skipped_tables,
+        elapsed_ms: res.duration_ms ?? syncProgress.value.elapsed_ms,
+        status,
+      };
       for (const failure of res.failures || []) {
         const tablePrefix = failure.table_name ? `[Tabel '${failure.table_name}'] ` : '';
         appendSyncLog({
@@ -377,8 +404,13 @@ async function handleStartSync(syncOptions) {
       status: 'failed',
       success: false,
       error: String(err),
+      duration_ms: Date.now() - syncStartedAt.value,
     };
-    syncProgress.value = { ...syncProgress.value, status: 'failed' };
+    syncProgress.value = {
+      ...syncProgress.value,
+      elapsed_ms: Date.now() - syncStartedAt.value,
+      status: 'failed',
+    };
     appendSyncLog({
       type: 'error',
       message: `Error: ${err}`,

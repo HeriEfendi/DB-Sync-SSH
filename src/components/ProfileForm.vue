@@ -519,9 +519,9 @@ onBeforeUnmount(() => {
   margin-top: 1rem;
 }
 .test-status-box.info {
-  background-color: #eff6ff;
-  color: #1e40af;
-  border: 1px solid #bfdbfe;
+  background-color: var(--primary-green-light);
+  color: var(--primary-green-hover);
+  border: 1px solid #a8e6c3;
 }
 .test-status-box.success {
   background-color: var(--success-green-bg);

@@ -3,7 +3,7 @@
     <header class="main-header">
       <div class="header-title-group">
         <div style="display: flex; align-items: center; gap: 0.5rem;">
-          <History :size="16" style="color: #f59e0b;" />
+          <History :size="16" style="color: var(--primary-green);" />
           <h1 class="main-title">Sync History</h1>
           <span v-if="historyList.length > 0" class="history-count-badge">
             {{ historyList.length }} runs
