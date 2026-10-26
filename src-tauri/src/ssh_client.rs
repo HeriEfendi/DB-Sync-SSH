@@ -29,6 +29,9 @@ pub fn establish_ssh_session(config: &SshConfig) -> Result<Session, String> {
     tcp.set_write_timeout(Some(Duration::from_secs(30))).ok();
 
     let mut session = Session::new().map_err(|e| format!("Gagal inisialisasi sesi SSH: {}", e))?;
+    // Smart Low-CPU Compression: negotiate fast zlib@openssh.com or zlib with fallback to none
+    session.method_pref(ssh2::MethodType::CompCs, "zlib@openssh.com,zlib,none").ok();
+    session.method_pref(ssh2::MethodType::CompSc, "zlib@openssh.com,zlib,none").ok();
     session.set_tcp_stream(tcp);
     session
         .handshake()
@@ -250,9 +253,9 @@ pub fn start_ssh_tunnel(
                         local_stream.set_nodelay(true).ok();
                         local_stream.set_nonblocking(true).ok();
 
-                        // 128 KiB high-throughput buffers (8x larger than default 16KB)
-                        let mut local_buf = [0u8; 131072];
-                        let mut remote_buf = [0u8; 131072];
+                        // 256 KiB high-throughput buffers (tuned for low OS context switching)
+                        let mut local_buf = vec![0u8; 262144];
+                        let mut remote_buf = vec![0u8; 262144];
                         let mut idle_spins = 0u32;
 
                         while !stop_worker.load(Ordering::SeqCst) {

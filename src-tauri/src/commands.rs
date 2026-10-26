@@ -39,6 +39,22 @@ pub async fn drop_local_tables(config: LocalDbConfig, tables: Vec<String>) -> Re
 }
 
 #[tauri::command]
+pub async fn compare_table_counts(
+    ssh_config: SshConfig,
+    remote_db_config: RemoteDbConfig,
+    local_db_config: LocalDbConfig,
+    tables: Option<Vec<String>>,
+) -> Result<Vec<crate::models::TableDiffInfo>, String> {
+    crate::sync_engine::compare_table_counts(
+        &ssh_config,
+        &remote_db_config,
+        &local_db_config,
+        tables,
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn get_all_tables_last_local_ids(
     config: LocalDbConfig,
     tables: Option<Vec<String>>,

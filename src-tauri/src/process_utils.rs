@@ -28,3 +28,17 @@ pub fn new_tokio_command<S: AsRef<std::ffi::OsStr>>(program: S) -> tokio::proces
     }
     cmd
 }
+
+/// Sets the OS pipe buffer capacity (e.g. 256 KB – 512 KB) to reduce context-switching during high-speed data stream.
+#[cfg(unix)]
+pub fn tune_pipe_capacity<T: std::os::unix::io::AsRawFd>(target: &T, size_bytes: usize) {
+    #[cfg(target_os = "linux")]
+    {
+        let fd = target.as_raw_fd();
+        // F_SETPIPE_SZ is 1031 on Linux kernel 2.6.35+
+        unsafe {
+            libc::fcntl(fd, 1031, size_bytes as libc::c_int);
+        }
+    }
+}
+

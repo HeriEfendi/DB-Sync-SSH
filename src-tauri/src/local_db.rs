@@ -284,6 +284,7 @@ pub fn spawn_mysql_child(
             .arg("--max-allowed-packet=1024M")
             .arg("--net-buffer-length=1M")
             .arg("--default-character-set=utf8mb4")
+            .arg("--init-command=SET SESSION foreign_key_checks=0; SET SESSION unique_checks=0; SET SESSION autocommit=1; SET SESSION sql_mode='';")
             .arg("-u")
             .arg(&local_config.username);
 
@@ -326,7 +327,8 @@ pub fn spawn_mysql_child(
             .arg("--quick")
             .arg("--max-allowed-packet=1024M")
             .arg("--net-buffer-length=1M")
-            .arg("--default-character-set=utf8mb4");
+            .arg("--default-character-set=utf8mb4")
+            .arg("--init-command=SET SESSION foreign_key_checks=0; SET SESSION unique_checks=0; SET SESSION autocommit=1; SET SESSION sql_mode='';");
 
         if !local_config.password.is_empty() {
             c.arg(format!("-p{}", local_config.password));
@@ -343,6 +345,11 @@ pub fn spawn_mysql_child(
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("Gagal menjalankan proses import MySQL lokal: {}", e))?;
+
+    #[cfg(unix)]
+    if let Some(ref stdin_ref) = child.stdin {
+        crate::process_utils::tune_pipe_capacity(stdin_ref, 512 * 1024);
+    }
 
     let stdin = child
         .stdin

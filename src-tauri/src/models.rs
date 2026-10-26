@@ -109,6 +109,17 @@ pub struct SyncOptions {
     pub sync_mode: Option<String>, // "incremental" | "fresh"
     #[serde(default)]
     pub incremental_watermarks: Option<std::collections::HashMap<String, WatermarkItem>>,
+    #[serde(default)]
+    pub concurrency: Option<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TableDiffInfo {
+    pub table_name: String,
+    pub remote_rows: i64,
+    pub local_rows: i64,
+    pub row_diff: i64,
+    pub status: String, // "in_sync" | "diverged" | "remote_only" | "local_only"
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

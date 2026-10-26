@@ -4,7 +4,7 @@ use crate::local_db::{
 };
 use crate::models::{
     incremental_primary_key, LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig,
-    SyncFailure, SyncOptions, SyncResult, TableInfo,
+    SyncFailure, SyncOptions, SyncResult, TableDiffInfo, TableInfo,
 };
 use crate::ssh_client::{establish_ssh_session, start_ssh_tunnel};
 use sqlx::mysql::MySqlPoolOptions;
@@ -505,6 +505,135 @@ pub async fn get_remote_tables(
     Ok(tables)
 }
 
+pub async fn compare_table_counts(
+    ssh_config: &SshConfig,
+    remote_db_config: &RemoteDbConfig,
+    local_db_config: &LocalDbConfig,
+    tables: Option<Vec<String>>,
+) -> Result<Vec<TableDiffInfo>, String> {
+    // 1. Fetch local table counts
+    let local_counts: HashMap<String, i64> = {
+        let conn_str = build_local_connection_string(local_db_config);
+        let pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(6))
+            .connect(&conn_str)
+            .await
+            .map_err(|e| format!("Gagal terhubung ke MySQL lokal: {}", e))?;
+
+        let rows = sqlx::query(
+            "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) AS total_rows 
+             FROM information_schema.TABLES 
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Gagal membaca baris tabel lokal: {}", e))?;
+
+        pool.close().await;
+
+        let mut map = HashMap::new();
+        for r in rows {
+            let name: String = r.try_get("TABLE_NAME").unwrap_or_default();
+            let total: i64 = r.try_get("total_rows").unwrap_or(0);
+            if !name.is_empty() {
+                map.insert(name, total);
+            }
+        }
+        map
+    };
+
+    // 2. Fetch remote table counts via SSH tunnel
+    let remote_counts: HashMap<String, i64> = {
+        let tunnel = start_ssh_tunnel(ssh_config, remote_db_config)?;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        let tunnel_conn_str = format!(
+            "mysql://{}:{}@127.0.0.1:{}/{}",
+            urlencoding::encode(&remote_db_config.username),
+            urlencoding::encode(&remote_db_config.password),
+            tunnel.local_port,
+            urlencoding::encode(&remote_db_config.database)
+        );
+
+        let pool = MySqlPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(std::time::Duration::from_secs(10))
+            .connect(&tunnel_conn_str)
+            .await
+            .map_err(|e| format!("Gagal terhubung ke remote DB via SSH tunnel: {}", e))?;
+
+        let rows = sqlx::query(
+            "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) AS total_rows 
+             FROM information_schema.TABLES 
+             WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' 
+             ORDER BY TABLE_NAME ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .map_err(|e| format!("Gagal membaca daftar tabel remote: {}", e))?;
+
+        pool.close().await;
+        drop(tunnel);
+
+        let mut map = HashMap::new();
+        for r in rows {
+            let name: String = r.try_get("TABLE_NAME").unwrap_or_default();
+            let total: i64 = r.try_get("total_rows").unwrap_or(0);
+            if !name.is_empty() {
+                map.insert(name, total);
+            }
+        }
+        map
+    };
+
+    // 3. Assemble comparison
+    let target_names: Vec<String> = match tables {
+        Some(list) if !list.is_empty() => list,
+        _ => {
+            let mut all_set = std::collections::BTreeSet::new();
+            for k in remote_counts.keys() {
+                all_set.insert(k.clone());
+            }
+            for k in local_counts.keys() {
+                all_set.insert(k.clone());
+            }
+            all_set.into_iter().collect()
+        }
+    };
+
+    let mut diffs = Vec::new();
+    for name in target_names {
+        let rem_opt = remote_counts.get(&name).copied();
+        let loc_opt = local_counts.get(&name).copied();
+
+        let (status, remote_rows, local_rows, row_diff) = match (rem_opt, loc_opt) {
+            (Some(rem), None) => ("remote_only".to_string(), rem, 0, rem),
+            (None, Some(loc)) => ("local_only".to_string(), 0, loc, -loc),
+            (Some(rem), Some(loc)) => {
+                let diff = rem - loc;
+                let st = if diff == 0 {
+                    "in_sync".to_string()
+                } else {
+                    "diverged".to_string()
+                };
+                (st, rem, loc, diff)
+            }
+            (None, None) => ("unknown".to_string(), 0, 0, 0),
+        };
+
+        diffs.push(TableDiffInfo {
+            table_name: name,
+            remote_rows,
+            local_rows,
+            row_diff,
+            status,
+        });
+    }
+
+    Ok(diffs)
+}
+
 fn format_number(n: usize) -> String {
     let s = n.to_string();
     let bytes = s.as_bytes();
@@ -639,6 +768,25 @@ impl MysqlDumpRowCounter {
     }
 }
 
+static DUMP_COMPRESSION_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+fn get_dump_compression_args(dump_bin: &str) -> &'static [String] {
+    DUMP_COMPRESSION_ARGS.get_or_init(|| {
+        let mut check_cmd = std::process::Command::new(dump_bin);
+        check_cmd.arg("--help");
+        if let Ok(output) = check_cmd.output() {
+            let help_text = String::from_utf8_lossy(&output.stdout);
+            if help_text.contains("--compression-algorithms") {
+                return vec![
+                    "--compression-algorithms=zstd,zlib,uncompressed".to_string(),
+                    "--zstd-compression-level=1".to_string(),
+                ];
+            }
+        }
+        vec!["--compress".to_string()]
+    })
+}
+
 async fn dump_table_chunk_to_stream(
     tunnel_port: u16,
     remote_db_config: &RemoteDbConfig,
@@ -663,8 +811,14 @@ async fn dump_table_chunk_to_stream(
         .arg("--no-create-info")
         .arg("--skip-triggers")
         .arg("--quick")
-        .arg("--single-transaction")
-        .arg("--compress")
+        .arg("--single-transaction");
+
+    // Smart Low-CPU Compression (zstd level 1 with zlib / compress fallback)
+    for arg in get_dump_compression_args(dump_bin) {
+        dump_cmd.arg(arg);
+    }
+
+    dump_cmd
         .arg("--net-buffer-length=1048576")
         .arg("--max-allowed-packet=1073741824")
         .arg("--default-character-set=utf8mb4");
@@ -690,6 +844,11 @@ async fn dump_table_chunk_to_stream(
     let mut dump_child = dump_cmd
         .spawn()
         .map_err(|e| format!("Gagal menjalankan {}: {}", dump_bin, e))?;
+
+    #[cfg(unix)]
+    if let Some(ref stdout_ref) = dump_child.stdout {
+        crate::process_utils::tune_pipe_capacity(stdout_ref, 512 * 1024);
+    }
 
     let dump_pid = dump_child.id();
     if let Some(pid) = dump_pid {
@@ -718,7 +877,8 @@ async fn dump_table_chunk_to_stream(
 
     if let Some(mut stdout) = dump_child.stdout.take() {
         use tokio::io::AsyncReadExt;
-        let mut buffer = [0u8; 131072];
+        // 256 KiB high-throughput stream buffer
+        let mut buffer = vec![0u8; 262144];
         let mut last_progress_rows = 0usize;
         let mut last_progress_time = Instant::now();
 
@@ -1023,7 +1183,133 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let total_tables = sync_options.tables.len();
     let sync_mode = sync_options.sync_mode.as_deref().unwrap_or("incremental");
     let is_fresh = sync_mode == "fresh";
-    let download_concurrency = if total_tables >= 2 { 2 } else { 1 };
+    let download_concurrency = sync_options
+        .concurrency
+        .map(|c| (c as usize).clamp(1, 4))
+        .unwrap_or(if total_tables >= 2 { 2 } else { 1 });
+
+    // Batched Fast-Check: identify tables with 0 changes in fast batches of UNION ALL across remote connection pool
+    let mut pre_skipped_set = HashSet::new();
+    if !is_fresh {
+        if let Some(ref wm_map) = sync_options.incremental_watermarks {
+            struct WatermarkCandidate {
+                table_name: String,
+                safe_table: String,
+                cond: String,
+            }
+
+            let mut candidates = Vec::new();
+            for table_item in &sync_options.tables {
+                let table_name = &table_item.name;
+                let table_is_fresh = is_fresh
+                    || !existing_local_tables.contains(table_name)
+                    || !local_schema_signatures.contains_key(table_name);
+
+                if !table_is_fresh && table_item.sync_data {
+                    if let Some(wm) = wm_map.get(table_name) {
+                        let pk_col_opt = pk_map.get(table_name).cloned();
+                        if let Some(ref pk_col) = pk_col_opt {
+                            if wm.primary_key.eq_ignore_ascii_case(pk_col.as_str()) {
+                                if let Ok(w_id) = wm.last_id.parse::<i128>() {
+                                    if w_id > 0 {
+                                        let safe_table = match sanitize_identifier(table_name) {
+                                            Ok(s) => s,
+                                            Err(_) => continue,
+                                        };
+                                        let safe_pk = match sanitize_identifier(pk_col) {
+                                            Ok(s) => s,
+                                            Err(_) => continue,
+                                        };
+                                        let updated_at_col = tables_with_updated_at
+                                            .contains(table_name)
+                                            .then(|| "`updated_at`".to_string());
+                                        let watermark_timestamp = wm
+                                            .last_sync_time
+                                            .as_deref()
+                                            .and_then(normalize_mysql_timestamp);
+
+                                        let cond = match (updated_at_col, watermark_timestamp) {
+                                            (Some(col), Some(ts)) => {
+                                                format!("{} > {} OR {} >= '{}'", safe_pk, w_id, col, ts)
+                                            }
+                                            _ => format!("{} > {}", safe_pk, w_id),
+                                        };
+
+                                        candidates.push(WatermarkCandidate {
+                                            table_name: table_name.clone(),
+                                            safe_table,
+                                            cond,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            let total_candidates = candidates.len();
+            if !candidates.is_empty() {
+                // Batch up to 40 tables per UNION ALL query to eliminate SSH round-trip latency
+                const BATCH_SIZE: usize = 40;
+                for chunk in candidates.chunks(BATCH_SIZE) {
+                    let union_sql = chunk
+                        .iter()
+                        .map(|c| {
+                            let escaped_name = c.table_name.replace('\'', "''");
+                            format!(
+                                "(SELECT '{}' AS _tbl FROM {} WHERE ({}) LIMIT 1)",
+                                escaped_name, c.safe_table, c.cond
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" UNION ALL ");
+
+                    match sqlx::query(&union_sql).fetch_all(&*remote_pool).await {
+                        Ok(rows) => {
+                            let mut changed_tables = HashSet::new();
+                            for r in rows {
+                                if let Ok(tbl) = r.try_get::<String, _>("_tbl") {
+                                    changed_tables.insert(tbl);
+                                }
+                            }
+                            for c in chunk {
+                                if !changed_tables.contains(&c.table_name) {
+                                    pre_skipped_set.insert(c.table_name.clone());
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!("[BatchWatermarkCheck] Batch query failed, falling back to individual checks: {}", err);
+                            // Fallback to individual checks for this chunk
+                            for c in chunk {
+                                let single_sql = format!(
+                                    "SELECT 1 FROM {} WHERE ({}) LIMIT 1",
+                                    c.safe_table, c.cond
+                                );
+                                if let Ok(None) = sqlx::query(&single_sql).fetch_optional(&*remote_pool).await {
+                                    pre_skipped_set.insert(c.table_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if !pre_skipped_set.is_empty() {
+                    emit_log(
+                        &app,
+                        "info",
+                        format!(
+                            "⚡ [Batch Fast-Check] {} dari {} tabel incremental tidak memiliki perubahan data baru (di-skip instan).",
+                            pre_skipped_set.len(),
+                            total_candidates
+                        ),
+                    );
+                }
+            }
+        }
+    }
+    let pre_skipped_tables = Arc::new(pre_skipped_set);
 
     emit_log(
         &app,
@@ -1499,6 +1785,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let local_tables_c = existing_local_tables.clone();
         let remote_schema_c = remote_schema_signatures.clone();
         let local_schema_c = local_schema_signatures.clone();
+        let pre_skipped_c = pre_skipped_tables.clone();
         let row_limit_opt = sync_options.row_limit;
 
         let handle = tokio::spawn(async move {
@@ -1518,6 +1805,30 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 };
 
                 let table_name = &table_item.name;
+
+                // INSTANT FAST-SKIP: Pre-checked table with 0 changes
+                if pre_skipped_c.contains(table_name) {
+                    if tx_c
+                        .send(PipelineMsg::TableFinished {
+                            table_name: table_name.clone(),
+                            table_index: idx + 1,
+                            total_rows_synced: 0,
+                            sync_data: table_item.sync_data,
+                        })
+                        .await
+                        .is_err()
+                        && !is_cancelled()
+                    {
+                        record_failure(
+                            &app_c,
+                            &failures_p,
+                            Some(table_name),
+                            "Mengirim status selesai ke worker MySQL lokal",
+                            "Worker impor lokal sudah berhenti",
+                        );
+                    }
+                    continue;
+                }
                 let safe_table = match sanitize_identifier(table_name) {
                     Ok(s) => s,
                     Err(e) => {

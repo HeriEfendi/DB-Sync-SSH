@@ -21,6 +21,7 @@ urlencoding = "2.1"
 ssh2 = "0.9"
 rfd = "0.15"
 dirs = "6.0"
+libc = "0.2"
 
 [lib]
 name = "db_sync_lib"
