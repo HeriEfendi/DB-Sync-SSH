@@ -110,6 +110,8 @@
               <option :value="100000">100.000 Row</option>
               <option :value="500000">500.000 Row</option>
               <option :value="1000000">1.000.000 Row</option>
+              <option :value="2000000">2.000.000 Row</option>
+              <option :value="5000000">5.000.000 Row</option>
               <option value="custom">Custom...</option>
             </select>
             <input
@@ -248,7 +250,7 @@
       </div>
       <div class="table-footer-status">
         <span>Menampilkan <strong>{{ filteredTables.length }}</strong> tabel</span>
-        <span>Terpilih: <strong style="color: var(--primary-blue)">{{ selectedCount }}</strong> dari {{ tables.length }} tabel</span>
+        <span>Terpilih: <strong style="color: var(--primary-green)">{{ selectedCount }}</strong> dari {{ tables.length }} tabel</span>
       </div>
     </div>
   </div>
@@ -257,6 +259,12 @@
 <script setup>
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
 import { Database, Search, RotateCw, Play, Settings } from 'lucide-vue-next';
+import {
+  getLastSelectedRowLimit,
+  getLastSelectedTemplateId,
+  setLastSelectedRowLimit,
+  setLastSelectedTemplateId,
+} from '../services/profileStore.js';
 
 const props = defineProps({
   profile: {
@@ -291,10 +299,20 @@ const emit = defineEmits([
 
 const searchInputRef = ref(null);
 const searchQuery = ref('');
-const selectedTemplateId = ref('all');
+const getValidTemplateId = (profile) => {
+  const storedId = getLastSelectedTemplateId(profile.id);
+  if (storedId === 'all' || (profile.templates || []).some((template) => template.id === storedId)) {
+    return storedId;
+  }
+  setLastSelectedTemplateId(profile.id, 'all');
+  return 'all';
+};
+const selectedTemplateId = ref(getValidTemplateId(props.profile));
+let shouldRestoreTemplate = selectedTemplateId.value !== 'all';
 const syncMode = ref('incremental'); // 'incremental' | 'fresh'
-const rowLimitPreset = ref(0); // 0 = unlimited, numbers = preset, 'custom' = custom input
-const customRowLimit = ref(10000);
+const initialRowLimit = getLastSelectedRowLimit(props.profile.id);
+const rowLimitPreset = ref(initialRowLimit.preset); // 0 = unlimited, numbers = preset, 'custom' = custom input
+const customRowLimit = ref(initialRowLimit.custom);
 
 // Per-table state: { selected: bool, sync_structure: bool, sync_data: bool }
 const tableStates = ref({});
@@ -302,7 +320,18 @@ const tableStates = ref({});
 watch(
   () => props.profile.id,
   () => {
-    selectedTemplateId.value = 'all';
+    selectedTemplateId.value = getValidTemplateId(props.profile);
+    shouldRestoreTemplate = selectedTemplateId.value !== 'all';
+    const rowLimit = getLastSelectedRowLimit(props.profile.id);
+    rowLimitPreset.value = rowLimit.preset;
+    customRowLimit.value = rowLimit.custom;
+  }
+);
+
+watch(
+  () => [rowLimitPreset.value, customRowLimit.value],
+  ([preset, custom]) => {
+    setLastSelectedRowLimit(props.profile.id, preset, custom);
   }
 );
 
@@ -319,9 +348,13 @@ function initTableStates() {
 }
 
 watch(
-  () => props.tables,
+  () => [props.tables, props.isLoadingTables],
   () => {
     initTableStates();
+    if (!props.isLoadingTables && shouldRestoreTemplate && props.tables.length > 0) {
+      shouldRestoreTemplate = false;
+      applyTemplate();
+    }
   },
   { immediate: true }
 );
@@ -420,6 +453,8 @@ function toggleMode(tableName, field, checked) {
 }
 
 function applyTemplate() {
+  setLastSelectedTemplateId(props.profile.id, selectedTemplateId.value);
+  shouldRestoreTemplate = false;
   if (selectedTemplateId.value === 'all') {
     handleSelectAll();
     return;
