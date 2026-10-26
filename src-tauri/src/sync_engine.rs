@@ -172,6 +172,41 @@ fn has_mysql_cli_errors(stderr: &str) -> bool {
     })
 }
 
+fn is_schema_mismatch_error(err: &str) -> bool {
+    let lower = err.to_lowercase();
+    lower.contains("unknown column")
+        || lower.contains("column count doesn't match")
+        || (lower.contains("table") && lower.contains("doesn't exist"))
+        || lower.contains("doesn't have a default value")
+        || lower.contains("data truncated")
+        || lower.contains("cannot be null")
+        || lower.contains("error 1054")
+        || lower.contains("error 1136")
+        || lower.contains("error 1146")
+        || lower.contains("error 1364")
+        || lower.contains("error 1265")
+        || lower.contains("error 1048")
+        || lower.contains("incorrect integer value")
+        || lower.contains("incorrect decimal value")
+        || lower.contains("incorrect date")
+        || lower.contains("error 1366")
+        || lower.contains("error 1292")
+}
+
+fn extract_clean_mysql_error(err: &str) -> String {
+    for line in err.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("ERROR ")
+            || trimmed.starts_with("ERROR:")
+            || trimmed.contains("Unknown column")
+            || trimmed.contains("doesn't exist")
+        {
+            return trimmed.to_string();
+        }
+    }
+    err.lines().next().unwrap_or(err).trim().to_string()
+}
+
 fn resolve_sync_status(
     was_cancelled: bool,
     fatal_failure: bool,
@@ -891,61 +926,84 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         .await
         .map_err(|e| format!("Gagal terhubung untuk memeriksa skema MySQL lokal: {}", e))?;
 
-    let local_tables_rows = sqlx::query(
-        "SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE'",
-    )
-    .fetch_all(&local_schema_pool)
-    .await
-    .unwrap_or_default();
-    let existing_local_tables: HashSet<String> = local_tables_rows
-        .iter()
-        .filter_map(|r| r.try_get::<String, _>("TABLE_NAME").ok())
-        .collect();
-    let existing_local_tables = Arc::new(existing_local_tables);
-
-    // Pre-query primary keys and update timestamp columns in batch queries.
-    let pk_query = "
-        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE
-        FROM information_schema.COLUMNS 
-        WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_KEY = 'PRI'
-        ORDER BY ORDINAL_POSITION ASC
+    // 1. Batch query local schema column metadata
+    let local_columns_query = "
+        SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE
+        FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE()
+        ORDER BY TABLE_NAME, ORDINAL_POSITION ASC
     ";
-    let mut pk_columns: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
-    let rows = sqlx::query(pk_query)
+    let local_col_rows = sqlx::query(local_columns_query)
+        .fetch_all(&local_schema_pool)
+        .await
+        .unwrap_or_default();
+
+    let mut local_schema_signatures: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut existing_local_tables: HashSet<String> = HashSet::new();
+
+    for r in local_col_rows {
+        let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
+        let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
+        let column_type: String = r.try_get("COLUMN_TYPE").unwrap_or_default();
+        let is_nullable: String = r.try_get("IS_NULLABLE").unwrap_or_default();
+
+        if !t_name.is_empty() && !c_name.is_empty() {
+            existing_local_tables.insert(t_name.clone());
+            local_schema_signatures
+                .entry(t_name)
+                .or_default()
+                .push((c_name, column_type, is_nullable));
+        }
+    }
+    let existing_local_tables = Arc::new(existing_local_tables);
+    let local_schema_signatures = Arc::new(local_schema_signatures);
+
+    // 2. Batch query remote schema metadata: PKs, updated_at columns, and full schema signatures
+    let remote_columns_query = "
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY
+        FROM information_schema.COLUMNS 
+        WHERE TABLE_SCHEMA = DATABASE()
+        ORDER BY TABLE_NAME, ORDINAL_POSITION ASC
+    ";
+    let remote_col_rows = sqlx::query(remote_columns_query)
         .fetch_all(&*remote_pool)
         .await
-        .map_err(|e| format!("Gagal membaca metadata primary key remote: {}", e))?;
-    for r in rows {
+        .map_err(|e| format!("Gagal membaca metadata kolom remote: {}", e))?;
+
+    let mut pk_columns: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+    let mut tables_with_updated_at: HashSet<String> = HashSet::new();
+    let mut remote_schema_signatures: HashMap<String, Vec<(String, String, String)>> = HashMap::new();
+
+    for r in remote_col_rows {
         let t_name: String = r.try_get("TABLE_NAME").unwrap_or_default();
         let c_name: String = r.try_get("COLUMN_NAME").unwrap_or_default();
         let data_type: String = r.try_get("DATA_TYPE").unwrap_or_default();
         let column_type: String = r.try_get("COLUMN_TYPE").unwrap_or_default();
+        let is_nullable: String = r.try_get("IS_NULLABLE").unwrap_or_default();
+        let column_key: String = r.try_get("COLUMN_KEY").unwrap_or_default();
+
         if !t_name.is_empty() && !c_name.is_empty() {
-            pk_columns
+            if column_key == "PRI" {
+                pk_columns
+                    .entry(t_name.clone())
+                    .or_default()
+                    .push((c_name.clone(), data_type, column_type.clone()));
+            }
+            if c_name.eq_ignore_ascii_case("updated_at") {
+                tables_with_updated_at.insert(t_name.clone());
+            }
+            remote_schema_signatures
                 .entry(t_name)
                 .or_default()
-                .push((c_name, data_type, column_type));
+                .push((c_name, column_type, is_nullable));
         }
     }
+
     let pk_map: HashMap<String, String> = pk_columns
         .iter()
         .filter_map(|(table, columns)| {
             incremental_primary_key(columns).map(|column| (table.clone(), column))
         })
-        .collect();
-
-    let updated_at_query = "
-        SELECT TABLE_NAME
-        FROM information_schema.COLUMNS
-        WHERE TABLE_SCHEMA = DATABASE() AND LOWER(COLUMN_NAME) = 'updated_at'
-    ";
-    let updated_at_rows = sqlx::query(updated_at_query)
-        .fetch_all(&*remote_pool)
-        .await
-        .map_err(|e| format!("Gagal membaca metadata kolom updated_at remote: {}", e))?;
-    let tables_with_updated_at: HashSet<String> = updated_at_rows
-        .iter()
-        .filter_map(|row| row.try_get::<String, _>("TABLE_NAME").ok())
         .collect();
     let pk_map: HashMap<String, String> = pk_map
         .into_iter()
@@ -953,6 +1011,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         .collect();
     let pk_map = Arc::new(pk_map);
     let tables_with_updated_at = Arc::new(tables_with_updated_at);
+    let remote_schema_signatures = Arc::new(remote_schema_signatures);
 
     let (sync_timestamp, sync_timestamp_epoch_ms): (String, i64) = sqlx::query_as(
         "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f'), CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) * 1000 AS SIGNED)",
@@ -1045,7 +1104,10 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                        SET SESSION autocommit=0;\n\
                        SET SESSION sql_mode='';\n\
                        SET SESSION net_read_timeout=600;\n\
-                       SET SESSION net_write_timeout=600;\n";
+                       SET SESSION net_write_timeout=600;\n\
+                       SET SESSION wait_timeout=600;\n\
+                       SET SESSION lock_wait_timeout=600;\n\
+                       SET SESSION innodb_lock_wait_timeout=600;\n";
         if let Err(e) = local_stdin.write_all(prelude.as_bytes()).await {
             fatal_failure_c.store(true, Ordering::SeqCst);
             record_failure(
@@ -1383,7 +1445,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             let message = if stderr_output.is_empty() {
                 format!("Proses MySQL lokal berhenti dengan status {}", status)
             } else {
-                stderr_output
+                let clean = extract_clean_mysql_error(&stderr_output);
+                if is_schema_mismatch_error(&stderr_output) {
+                    format!("Ketidakcocokan skema tabel: {}", clean)
+                } else {
+                    clean
+                }
             };
             if touched_tables.is_empty() {
                 record_failure(
@@ -1430,6 +1497,8 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let failures_p = failures.clone();
         let tx_c = tx.clone();
         let local_tables_c = existing_local_tables.clone();
+        let remote_schema_c = remote_schema_signatures.clone();
+        let local_schema_c = local_schema_signatures.clone();
         let row_limit_opt = sync_options.row_limit;
 
         let handle = tokio::spawn(async move {
@@ -1464,12 +1533,51 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 };
 
                 let mut table_is_fresh = is_fresh;
-                if !table_is_fresh && !local_tables_c.contains(table_name) {
-                    table_is_fresh = true;
+
+                if !is_fresh {
+                    let exists_locally = local_tables_c.contains(table_name);
+                    if !exists_locally {
+                        table_is_fresh = true;
+                        emit_log(
+                            &app_c,
+                            "info",
+                            format!(
+                                "[Tabel '{}'] ℹ️ Tabel baru terdeteksi di server (belum ada di lokal). Mengalihkan ke Fresh Sync...",
+                                table_name
+                            ),
+                        );
+                    } else {
+                        let remote_cols = remote_schema_c.get(table_name);
+                        let local_cols = local_schema_c.get(table_name);
+
+                        let schema_drift = match (remote_cols, local_cols) {
+                            (Some(r_cols), Some(l_cols)) => {
+                                r_cols.len() != l_cols.len()
+                                    || r_cols.iter().zip(l_cols.iter()).any(|(r, l)| {
+                                        r.0 != l.0 // Column name
+                                            || r.1.to_lowercase() != l.1.to_lowercase() // Column type
+                                            || r.2 != l.2 // Nullability
+                                    })
+                            }
+                            _ => true,
+                        };
+
+                        if schema_drift {
+                            table_is_fresh = true;
+                            emit_log(
+                                &app_c,
+                                "warning",
+                                format!(
+                                    "[Tabel '{}'] ⚠️ Terdeteksi perubahan struktur tabel di server (skema lokal tidak selaras). Otomatis dialihkan ke FRESH SYNC untuk menyelaraskan struktur & data!",
+                                    table_name
+                                ),
+                            );
+                        }
+                    }
                 }
 
                 // A. Structure DDL
-                let need_structure_ddl = table_item.sync_structure && (is_fresh || !local_tables_c.contains(table_name));
+                let need_structure_ddl = table_item.sync_structure && (is_fresh || table_is_fresh || !local_tables_c.contains(table_name));
                 if need_structure_ddl {
                     emit_log(
                         &app_c,
@@ -1976,9 +2084,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 #[cfg(test)]
 mod tests {
     use super::{
-        build_chunk_where_clause, has_mysql_cli_errors, normalize_mysql_timestamp,
-        progress_table_counts, resolve_sync_status, table_has_no_data_to_sync,
-        MysqlDumpRowCounter,
+        build_chunk_where_clause, extract_clean_mysql_error, has_mysql_cli_errors,
+        is_schema_mismatch_error, normalize_mysql_timestamp, progress_table_counts,
+        resolve_sync_status, table_has_no_data_to_sync, MysqlDumpRowCounter,
     };
     use crate::models::SyncFailure;
     use std::collections::HashSet;
@@ -2113,5 +2221,20 @@ mod tests {
             build_chunk_where_clause("`id`", None, 500, None),
             "--where=`id` <= 500"
         );
+    }
+
+    #[test]
+    fn schema_mismatch_detection_identifies_structure_errors_and_extracts_clean_line() {
+        let err1 = "ERROR 1054 (42S22) at line 12: Unknown column 'new_col' in 'field list'";
+        assert!(is_schema_mismatch_error(err1));
+        assert_eq!(extract_clean_mysql_error(err1), err1);
+
+        let err2 = "ERROR 1146 (42S02): Table 'test.not_exists' doesn't exist";
+        assert!(is_schema_mismatch_error(err2));
+        assert_eq!(extract_clean_mysql_error(err2), err2);
+
+        let generic_err = "ERROR 2006 (HY000): MySQL server has gone away";
+        assert!(!is_schema_mismatch_error(generic_err));
+        assert_eq!(extract_clean_mysql_error(generic_err), generic_err);
     }
 }
