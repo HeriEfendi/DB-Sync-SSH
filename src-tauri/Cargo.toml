@@ -23,6 +23,12 @@ rfd = "0.15"
 dirs = "6.0"
 libc = "0.2"
 
+# The bundled libssh2 build uses WinCNG by default, which disables the modern
+# curve25519 and ECDH key exchanges that our SSH servers commonly require.
+# Use the OpenSSL backend on Windows so it offers the same KEX support as Linux.
+[target.'cfg(windows)'.dependencies]
+ssh2 = { version = "0.9", features = ["openssl-on-win32", "vendored-openssl"] }
+
 [lib]
 name = "db_sync_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
