@@ -191,6 +191,52 @@
             </div>
           </div>
 
+          <!-- Sync Logs -->
+          <div class="drawer-section">
+            <div class="log-section-header" @click="logsExpanded = !logsExpanded">
+              <div class="log-section-title">
+                <AlertCircle :size="13" />
+                <span>Log Sinkronisasi{{ selectedItemLogs.length > 0 ? ` (${selectedItemLogs.length})` : '' }}</span>
+                <span class="log-count-pill error" v-if="errorLogCount > 0">{{ errorLogCount }} error</span>
+                <span class="log-count-pill warn" v-if="warnLogCount > 0">{{ warnLogCount }} warn</span>
+              </div>
+              <span class="log-toggle-icon">{{ logsExpanded ? '▲' : '▼' }}</span>
+            </div>
+
+            <div v-if="logsExpanded">
+              <!-- No logs stored (old entry) -->
+              <div v-if="selectedItemLogs.length === 0" class="log-empty-state">
+                <span>Log tidak tersedia untuk riwayat ini.</span>
+                <span class="log-empty-hint">Log hanya tersimpan untuk sinkronisasi yang dijalankan setelah versi ini.</span>
+              </div>
+
+              <!-- Log list -->
+              <div v-else class="log-list">
+                <div
+                  v-for="(log, lIdx) in selectedItemLogs"
+                  :key="lIdx"
+                  class="log-entry"
+                  :class="log.type"
+                >
+                  <div class="log-entry-header">
+                    <span class="log-type-badge" :class="log.type">
+                      {{
+                        log.type === 'error' ? '✕ ERROR'
+                        : log.type === 'warn' || log.type === 'warning' ? '⚠ WARN'
+                        : log.type === 'success' ? '✓ OK'
+                        : 'ℹ INFO'
+                      }}
+                    </span>
+                    <span v-if="log.table_name" class="log-table-tag">[{{ log.table_name }}]</span>
+                    <span v-if="log.timestamp" class="log-timestamp">{{ log.timestamp }}</span>
+                  </div>
+                  <div class="log-message">{{ log.message }}</div>
+                  <div v-if="log.details" class="log-details">{{ log.details }}</div>
+                </div>
+              </div>
+            </div>
+          </div>
+
           <!-- Synced Tables List -->
           <div class="drawer-section">
             <div class="section-header-row">
@@ -252,6 +298,7 @@ import {
   History,
   CheckCircle2,
   AlertTriangle,
+  AlertCircle,
   XCircle,
   Database,
   Trash2,
@@ -270,6 +317,20 @@ const emit = defineEmits(['clear-history', 'rerun-sync']);
 
 const selectedItem = ref(null);
 const tableFilterQuery = ref('');
+const logsExpanded = ref(true);
+
+// Computed: logs for currently selected history item
+const selectedItemLogs = computed(() => {
+  return selectedItem.value?.logs || [];
+});
+
+const errorLogCount = computed(() =>
+  selectedItemLogs.value.filter((l) => l.type === 'error').length
+);
+
+const warnLogCount = computed(() =>
+  selectedItemLogs.value.filter((l) => l.type === 'warn' || l.type === 'warning').length
+);
 
 const totalRowsCopied = computed(() => {
   return props.historyList.reduce((sum, item) => sum + (Number(item.rows_copied) || 0), 0);
@@ -365,7 +426,7 @@ onBeforeUnmount(() => {
 }
 
 .drawer-panel {
-  width: 440px;
+  width: 560px;
   max-width: 90vw;
   height: 100%;
   background: #ffffff;
@@ -597,4 +658,188 @@ onBeforeUnmount(() => {
   justify-content: flex-end;
   gap: 0.625rem;
 }
+
+/* ── Log Section ── */
+.log-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 5px 8px;
+  border-radius: var(--radius-sm);
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s ease;
+}
+
+.log-section-header:hover {
+  background: #e8eef5;
+}
+
+.log-section-title {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78125rem;
+  font-weight: 600;
+  color: #0f172a;
+}
+
+.log-toggle-icon {
+  font-size: 0.6rem;
+  color: #94a3b8;
+}
+
+.log-count-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 6px;
+  border-radius: 99px;
+  font-size: 0.625rem;
+  font-weight: 700;
+}
+
+.log-count-pill.error {
+  background: #fee2e2;
+  color: #b91c1c;
+}
+
+.log-count-pill.warn {
+  background: #fef3c7;
+  color: #92400e;
+}
+
+.log-list {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  max-height: 260px;
+  overflow-y: auto;
+  padding: 2px 0;
+}
+
+.log-entry {
+  border-radius: var(--radius-sm);
+  padding: 6px 8px;
+  font-size: 0.71875rem;
+  border-left: 3px solid transparent;
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+}
+
+.log-entry.error {
+  background: #fff5f5;
+  border-color: #fecaca;
+  border-left-color: #ef4444;
+}
+
+.log-entry.warn,
+.log-entry.warning {
+  background: #fffbeb;
+  border-color: #fde68a;
+  border-left-color: #f59e0b;
+}
+
+.log-entry.info {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  border-left-color: #3b82f6;
+}
+
+.log-entry-header {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+  margin-bottom: 3px;
+}
+
+.log-type-badge {
+  font-size: 0.5625rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.log-type-badge.error {
+  background: #fecaca;
+  color: #991b1b;
+}
+
+.log-type-badge.warn,
+.log-type-badge.warning {
+  background: #fde68a;
+  color: #78350f;
+}
+
+.log-type-badge.info {
+  background: #bfdbfe;
+  color: #1e40af;
+}
+
+.log-type-badge.success {
+  background: #dcfce7;
+  color: #15803d;
+}
+
+.log-table-tag {
+  font-family: var(--font-mono);
+  font-size: 0.6875rem;
+  color: #475569;
+  font-weight: 600;
+}
+
+.log-timestamp {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  color: #94a3b8;
+  white-space: nowrap;
+}
+
+.log-message {
+  color: #1e293b;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.log-details {
+  margin-top: 4px;
+  font-family: var(--font-mono);
+  font-size: 0.625rem;
+  color: #64748b;
+  word-break: break-all;
+  white-space: pre-wrap;
+  background: rgba(0,0,0,0.03);
+  padding: 3px 5px;
+  border-radius: 3px;
+  line-height: 1.5;
+}
+
+.log-entry.success {
+  background: #f0fdf4;
+  border-color: #bbf7d0;
+  border-left-color: #22c55e;
+}
+
+.log-empty-state {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 10px 10px;
+  border: 1px dashed #e2e8f0;
+  border-radius: var(--radius-sm);
+  color: #94a3b8;
+  font-size: 0.71875rem;
+  font-style: italic;
+}
+
+.log-empty-hint {
+  font-size: 0.625rem;
+  color: #cbd5e1;
+}
 </style>
+

@@ -1,5 +1,17 @@
 <template>
-  <aside class="sidebar">
+  <aside class="sidebar" :class="{ 'sidebar-collapsed': collapsed }">
+    <!-- Drag / Toggle handle on the RIGHT edge -->
+    <div
+      class="sidebar-resize-handle"
+      @mousedown.prevent="startDrag"
+      @touchstart.prevent="startDragTouch"
+      @click="onHandleClick"
+      title="Seret ke kiri untuk menyembunyikan, klik untuk toggle"
+    >
+      <ChevronLeft :size="13" class="handle-chevron" :class="{ 'rotated': collapsed }" />
+    </div>
+
+    <template v-if="!collapsed">
     <div class="sidebar-top">
       <div class="sidebar-header">
         <div class="sidebar-brand-group">
@@ -60,6 +72,32 @@
         <span>Sync History</span>
       </button>
     </div>
+    </template>
+
+    <!-- Collapsed icon-only state -->
+    <template v-if="collapsed">
+      <div class="sidebar-collapsed-icons">
+        <img class="sidebar-brand-icon" src="/favicon.svg" alt="" style="width:22px;height:22px;opacity:0.7;" />
+        <div
+          v-for="profile in profiles"
+          :key="profile.id"
+          class="collapsed-profile-dot"
+          :class="{ active: currentView === 'tables' && activeProfileId === profile.id }"
+          :title="profile.name"
+          @click="$emit('select-profile', profile.id)"
+        >
+          <Database :size="14" />
+        </div>
+        <button
+          class="collapsed-history-btn"
+          :class="{ active: currentView === 'history' }"
+          title="Sync History"
+          @click="$emit('open-history')"
+        >
+          <History :size="14" />
+        </button>
+      </div>
+    </template>
 
     <!-- Right-click Context Menu -->
     <div
@@ -109,7 +147,7 @@
 <script setup>
 import { ref, onMounted, onBeforeUnmount } from 'vue';
 import { getVersion } from '@tauri-apps/api/app';
-import { Database, Plus, History, MoreVertical, Pencil, Trash2, AlertTriangle } from 'lucide-vue-next';
+import { Database, Plus, History, MoreVertical, Pencil, Trash2, AlertTriangle, ChevronLeft } from 'lucide-vue-next';
 
 const appVersion = ref('...');
 
@@ -135,6 +173,79 @@ const emit = defineEmits([
   'edit-profile',
   'delete-profile',
 ]);
+
+// ── Collapse / drag state ──────────────────────────────────────────────────
+const collapsed = ref(false);
+const COLLAPSE_THRESHOLD = 60; // px dragged to the left to trigger collapse
+let dragStartX = 0;
+let dragActive = false;
+let movedEnough = false;
+
+function startDrag(e) {
+  dragActive = true;
+  movedEnough = false;
+  dragStartX = e.clientX;
+  window.addEventListener('mousemove', onDragMove);
+  window.addEventListener('mouseup', onDragEnd);
+}
+
+function startDragTouch(e) {
+  dragActive = true;
+  movedEnough = false;
+  dragStartX = e.touches[0].clientX;
+  window.addEventListener('touchmove', onDragMoveTouch, { passive: false });
+  window.addEventListener('touchend', onDragEndTouch);
+}
+
+function onDragMove(e) {
+  if (!dragActive) return;
+  const delta = dragStartX - e.clientX; // positive = dragged left
+  if (delta > 8) movedEnough = true;
+  if (delta >= COLLAPSE_THRESHOLD && !collapsed.value) {
+    collapsed.value = true;
+    endDrag();
+  }
+}
+
+function onDragMoveTouch(e) {
+  if (!dragActive) return;
+  e.preventDefault();
+  const delta = dragStartX - e.touches[0].clientX;
+  if (delta > 8) movedEnough = true;
+  if (delta >= COLLAPSE_THRESHOLD && !collapsed.value) {
+    collapsed.value = true;
+    endDragTouch();
+  }
+}
+
+function onDragEnd() {
+  endDrag();
+}
+
+function onDragEndTouch() {
+  endDragTouch();
+}
+
+function endDrag() {
+  dragActive = false;
+  window.removeEventListener('mousemove', onDragMove);
+  window.removeEventListener('mouseup', onDragEnd);
+}
+
+function endDragTouch() {
+  dragActive = false;
+  window.removeEventListener('touchmove', onDragMoveTouch);
+  window.removeEventListener('touchend', onDragEndTouch);
+}
+
+function onHandleClick() {
+  // Only toggle if it was a click (not a drag)
+  if (!movedEnough) {
+    collapsed.value = !collapsed.value;
+  }
+  movedEnough = false;
+}
+// ──────────────────────────────────────────────────────────────────────────
 
 const contextMenu = ref({
   visible: false,
@@ -204,5 +315,9 @@ onMounted(async () => {
 onBeforeUnmount(() => {
   window.removeEventListener('click', onWindowClick);
   window.removeEventListener('keydown', onKeyDown);
+  window.removeEventListener('mousemove', onDragMove);
+  window.removeEventListener('mouseup', onDragEnd);
+  window.removeEventListener('touchmove', onDragMoveTouch);
+  window.removeEventListener('touchend', onDragEndTouch);
 });
 </script>

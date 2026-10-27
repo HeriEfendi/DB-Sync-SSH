@@ -387,6 +387,8 @@ async function handleStartSync(syncOptions) {
         failures: res.failures || [],
         mode: syncOptions.sync_mode || 'incremental',
         row_limit: syncOptions.row_limit,
+        // Save all meaningful logs (excluding pure progress/tick entries without message)
+        logs: syncLogs.value.filter((l) => l.message && l.message.trim()),
       };
       historyList.value = addHistoryEntry(newEntry);
 
@@ -457,7 +459,9 @@ async function handleStartSync(syncOptions) {
       failures: [{ stage: 'Koneksi / Sync', message: String(err) }],
       mode: syncOptions.sync_mode || 'incremental',
       row_limit: syncOptions.row_limit,
+      logs: syncLogs.value.filter((l) => l.message && l.message.trim()),
     });
+
     if ('Notification' in window && Notification.permission === 'granted') {
       new Notification('DB-Sync-Ssh', { body: `Sinkronisasi '${syncingProfile.name}' gagal: ${err}` });
     }
