@@ -1138,24 +1138,28 @@ onBeforeUnmount(() => {
 }
 
 .sync-mode-header-wrap {
-  display: flex;
+  display: grid;
+  grid-template-columns: 86px auto;
   align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
+  gap: 0.75rem;
+  height: 100%;
 }
 
 .check-label-header {
   display: inline-flex;
   align-items: center;
-  gap: 0.25rem;
+  gap: 0.3125rem;
   font-size: 0.6875rem;
-  font-weight: 600;
-  color: #475569;
+  font-weight: 700;
+  color: #0f172a;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
   cursor: pointer;
   user-select: none;
+  white-space: nowrap;
 }
 
 .check-label-header:hover {
-  color: #0f172a;
+  color: #000000;
 }
 </style>
