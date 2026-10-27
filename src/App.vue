@@ -296,6 +296,11 @@ async function setupEventListeners() {
       const payload = event.payload;
       if (payload) {
         syncProgress.value = payload;
+        const total = payload.total_tables || 0;
+        const processed = payload.processed_tables ?? payload.completed_tables ?? 0;
+        const pct = total > 0 ? Math.round((processed / total) * 100) : 0;
+        const label = `${payload.current_table_index || 0}/${total} (${payload.current_table_name || 'Menyiapkan...'})`;
+        updateAppletProgress(pct, label);
       }
     });
     unlisteners.push(unProgress);
@@ -490,7 +495,8 @@ async function handleStartSync(syncOptions) {
     });
 
     if ('Notification' in window && Notification.permission === 'granted') {
-      new Notification('DB-Sync-Ssh', { body: `Sinkronisasi '${syncingProfile.name}' gagal: ${err}` });
+      const n = new Notification('DB-Sync-Ssh', { body: `Sinkronisasi '${syncingProfile.name}' gagal: ${err}` });
+      setTimeout(() => n.close(), 5000);
     }
   } finally {
     isSyncing.value = false;

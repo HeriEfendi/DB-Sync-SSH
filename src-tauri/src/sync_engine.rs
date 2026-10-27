@@ -402,6 +402,22 @@ pub fn emit_progress<R: tauri::Runtime>(
     };
     let _ = app.emit("sync-progress", payload);
 
+    let pct = if total_tables > 0 {
+        ((processed_tables as f64 / total_tables as f64) * 100.0).round().min(100.0) as u64
+    } else {
+        0
+    };
+
+    use tauri::Manager;
+    for (_, win) in app.webview_windows() {
+        let _ = win.set_progress_bar(tauri::window::ProgressBarState {
+            progress: Some(pct),
+            status: Some(tauri::window::ProgressBarStatus::Normal),
+        });
+        if status == "syncing" || status == "in_progress" {
+            let _ = win.set_title(&format!("[{}%] ({} / {} Tabel) DB Sync Engine", pct, current_table_index, total_tables));
+        }
+    }
 }
 
 pub async fn test_ssh_and_remote_db(
@@ -2148,7 +2164,20 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
     let _ = app.emit("sync-finished", &result);
 
-
+    use tauri::Manager;
+    for (_, win) in app.webview_windows() {
+        let _ = win.set_progress_bar(tauri::window::ProgressBarState {
+            progress: None,
+            status: Some(tauri::window::ProgressBarStatus::None),
+        });
+        let finish_title = match status {
+            "success" => "[✓ Selesai] DB Sync Engine SSH",
+            "partial" => "[⚠ Sebagian Selesai] DB Sync Engine SSH",
+            "cancelled" => "[Dibatalkan] DB Sync Engine SSH",
+            _ => "[✕ Gagal] DB Sync Engine SSH",
+        };
+        let _ = win.set_title(finish_title);
+    }
     let (log_type, summary) = match status {
         "success" => (
             "success",

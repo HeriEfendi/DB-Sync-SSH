@@ -7,6 +7,8 @@
       'widget-partial': !isSyncing && result?.status === 'partial',
       'widget-failed': !isSyncing && (result?.status === 'failed' || result?.status === 'cancelled'),
     }"
+    @mouseenter="onMouseEnter"
+    @mouseleave="onMouseLeave"
   >
     <!-- Top Row: Status Icon, Title, Actions -->
     <div class="widget-header">
@@ -21,6 +23,15 @@
       </div>
 
       <div class="widget-actions">
+        <!-- 5s Auto-dismiss counter badge -->
+        <span
+          v-if="!isSyncing && result"
+          class="dismiss-counter-badge"
+          :title="isHovered ? 'Hitung mundur ditahan selama kursor di sini' : `Menutup otomatis dalam ${dismissCountdown}s`"
+        >
+          {{ isHovered ? 'Dijeda' : `${dismissCountdown}s` }}
+        </span>
+
         <button
           type="button"
           class="widget-btn-icon"
@@ -43,7 +54,7 @@
           v-else
           type="button"
           class="widget-btn-icon"
-          title="Tutup notifikasi ini"
+          title="Tutup notifikasi ini sekarang"
           @click="$emit('dismiss')"
         >
           <X :size="13" />
@@ -54,6 +65,11 @@
     <!-- Progress Bar (while syncing) -->
     <div v-if="isSyncing" class="widget-progress-track">
       <div class="widget-progress-fill" :style="{ width: percentComplete + '%' }"></div>
+    </div>
+
+    <!-- Auto-dismiss bar (after finish, shrinks over 5 seconds) -->
+    <div v-else-if="result" class="dismiss-progress-track">
+      <div class="dismiss-progress-fill" :style="{ width: ((dismissCountdown / 5) * 100) + '%' }"></div>
     </div>
 
     <!-- Body Info -->
@@ -82,6 +98,9 @@
         <span v-if="isSyncing" class="widget-time-pill">
           ⏱️ {{ elapsedLabel }}
         </span>
+        <span v-if="!isSyncing && result" class="widget-dismiss-hint">
+          {{ isHovered ? 'Arahkan kursor keluar untuk menutup' : `Menutup otomatis dalam ${dismissCountdown}s` }}
+        </span>
         <button
           v-if="!isSyncing"
           type="button"
@@ -96,7 +115,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue';
+import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue';
 import {
   CheckCircle2,
   AlertTriangle,
@@ -129,10 +148,57 @@ const props = defineProps({
   startedAt: { type: Number, default: 0 },
 });
 
-defineEmits(['expand', 'stop-sync', 'dismiss']);
+const emit = defineEmits(['expand', 'stop-sync', 'dismiss']);
 
 const currentTime = ref(Date.now());
-let timer;
+let timer = null;
+
+// 5-second auto dismiss timer
+const dismissCountdown = ref(5);
+let countdownInterval = null;
+const isHovered = ref(false);
+
+function startAutoDismiss() {
+  clearAutoDismiss();
+  if (props.isSyncing || !props.result) return;
+  dismissCountdown.value = 5;
+
+  countdownInterval = setInterval(() => {
+    if (isHovered.value) return; // Jeda hitung mundur jika mouse sedang berada di widget
+    dismissCountdown.value -= 1;
+    if (dismissCountdown.value <= 0) {
+      clearAutoDismiss();
+      emit('dismiss');
+    }
+  }, 1000);
+}
+
+function clearAutoDismiss() {
+  if (countdownInterval) {
+    clearInterval(countdownInterval);
+    countdownInterval = null;
+  }
+}
+
+watch(
+  () => !props.isSyncing && !!props.result,
+  (isFinished) => {
+    if (isFinished) {
+      startAutoDismiss();
+    } else {
+      clearAutoDismiss();
+    }
+  },
+  { immediate: true }
+);
+
+function onMouseEnter() {
+  isHovered.value = true;
+}
+
+function onMouseLeave() {
+  isHovered.value = false;
+}
 
 onMounted(() => {
   timer = setInterval(() => {
@@ -142,6 +208,7 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   clearInterval(timer);
+  clearAutoDismiss();
 });
 
 const percentComplete = computed(() => {
@@ -387,5 +454,43 @@ function formatNumber(n) {
 
 .widget-link-btn:hover {
   text-decoration: underline;
+}
+
+.dismiss-counter-badge {
+  font-size: 0.625rem;
+  font-family: var(--font-mono);
+  font-weight: 700;
+  background: rgba(15, 23, 42, 0.08);
+  color: #475569;
+  padding: 1px 6px;
+  border-radius: 99px;
+  letter-spacing: 0.02em;
+}
+
+.dismiss-progress-track {
+  width: 100%;
+  height: 2.5px;
+  background-color: rgba(0, 0, 0, 0.06);
+  overflow: hidden;
+}
+
+.dismiss-progress-fill {
+  height: 100%;
+  background: #10b981;
+  transition: width 1s linear;
+}
+
+.widget-partial .dismiss-progress-fill {
+  background: #f59e0b;
+}
+
+.widget-failed .dismiss-progress-fill {
+  background: #ef4444;
+}
+
+.widget-dismiss-hint {
+  font-size: 0.625rem;
+  color: #94a3b8;
+  font-style: italic;
 }
 </style>
