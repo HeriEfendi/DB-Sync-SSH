@@ -1,6 +1,6 @@
 [package]
 name = "db-sync-ssh"
-version = "0.3.2"
+version = "0.3.3"
 description = "DB Sync Engine - MySQL/MariaDB over SSH"
 authors = ["Heri Efendi <hheri58@gmail.com>"]
 edition = "2021"
