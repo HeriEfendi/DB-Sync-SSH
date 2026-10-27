@@ -376,6 +376,30 @@ async function handleStartSync(syncOptions) {
       const secs = durationSec % 60;
       const durText = mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
 
+      const failedTableNames = [
+        ...new Set(
+          (res.failures || [])
+            .map((f) => f.table_name)
+            .filter(Boolean)
+        ),
+      ];
+
+      const structureChangedTables = [
+        ...new Set(
+          (res.schema_drift_tables || []).concat(
+            syncLogs.value
+              .filter((l) =>
+                l.message && (
+                  l.message.includes('perubahan struktur') ||
+                  l.message.includes('skema lokal tidak selaras')
+                )
+              )
+              .map((l) => l.table_name || extractTableName(l.message))
+              .filter(Boolean)
+          )
+        ),
+      ];
+
       const newEntry = {
         profile_name: syncingProfile.name || 'database',
         profile_id: syncingProfile.id,
@@ -383,12 +407,14 @@ async function handleStartSync(syncOptions) {
         tables_count: res.total_tables || 0,
         rows_copied: res.total_rows_synced || 0,
         duration_text: durText,
-        table_names: selectedTables,
+        // Hemat memori: hanya catat tabel gagal dan tabel dengan perubahan struktur
+        failed_tables: failedTableNames,
+        structure_changed_tables: structureChangedTables,
         failures: res.failures || [],
         mode: syncOptions.sync_mode || 'incremental',
         row_limit: syncOptions.row_limit,
-        // Save all meaningful logs (excluding pure progress/tick entries without message)
-        logs: syncLogs.value.filter((l) => l.message && l.message.trim()),
+        // Hemat memori: abaikan log tipe info yang menuhin log
+        logs: syncLogs.value.filter((l) => l.message && l.message.trim() && l.type !== 'info'),
       };
       historyList.value = addHistoryEntry(newEntry);
 
@@ -455,11 +481,12 @@ async function handleStartSync(syncOptions) {
       tables_count: selectedTables.length,
       rows_copied: 0,
       duration_text: '—',
-      table_names: selectedTables,
+      failed_tables: [],
+      structure_changed_tables: [],
       failures: [{ stage: 'Koneksi / Sync', message: String(err) }],
       mode: syncOptions.sync_mode || 'incremental',
       row_limit: syncOptions.row_limit,
-      logs: syncLogs.value.filter((l) => l.message && l.message.trim()),
+      logs: syncLogs.value.filter((l) => l.message && l.message.trim() && l.type !== 'info'),
     });
 
     if ('Notification' in window && Notification.permission === 'granted') {
@@ -469,6 +496,12 @@ async function handleStartSync(syncOptions) {
     isSyncing.value = false;
     isCancelling.value = false;
   }
+}
+
+function extractTableName(msg) {
+  if (!msg) return null;
+  const match = msg.match(/\[Tabel ['"]?([^'"\]]+)['"]?\]/);
+  return match ? match[1] : null;
 }
 
 async function handleRerunSync(historyItem) {
@@ -482,7 +515,13 @@ async function handleRerunSync(historyItem) {
   }
   currentView.value = 'tables';
 
-  const tablesToSync = (historyItem.table_names || []).map((name) => ({
+  // Prioritas tabel untuk diulang: tabel gagal & tabel perubahan struktur, atau fallback table_names riwayat lama
+  const failedList = historyItem.failed_tables || (historyItem.failures || []).map((f) => f.table_name).filter(Boolean);
+  const changedList = historyItem.structure_changed_tables || [];
+  const targetNames = [...new Set([...failedList, ...changedList])];
+  const namesToSync = targetNames.length > 0 ? targetNames : (historyItem.table_names || []);
+
+  const tablesToSync = namesToSync.map((name) => ({
     name,
     sync_structure: true,
     sync_data: true,

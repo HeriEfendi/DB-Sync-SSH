@@ -401,6 +401,7 @@ pub fn emit_progress<R: tauri::Runtime>(
         status: status.to_string(),
     };
     let _ = app.emit("sync-progress", payload);
+
 }
 
 pub async fn test_ssh_and_remote_db(
@@ -1299,6 +1300,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let total_rows_imported = Arc::new(AtomicUsize::new(0));
     let completed_table_names = Arc::new(Mutex::new(HashSet::<String>::new()));
     let skipped_table_names = Arc::new(Mutex::new(HashSet::<String>::new()));
+    let schema_drift_tables = Arc::new(Mutex::new(HashSet::<String>::new()));
 
     // ---------------------------------------------------------------------------------
     // Concurrent Workers: Each worker owns 1 SSH Download + 1 Dedicated MySQL Local Importer
@@ -1324,6 +1326,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let total_rows_imported_c = total_rows_imported.clone();
         let completed_table_names_c = completed_table_names.clone();
         let skipped_table_names_c = skipped_table_names.clone();
+        let schema_drift_tables_c = schema_drift_tables.clone();
         let row_limit_opt = sync_options.row_limit;
         let total_tables_c = total_tables;
         let started_at_c = start_time;
@@ -1492,14 +1495,21 @@ pub async fn run_sync_task<R: tauri::Runtime>(
 
                         if schema_drift {
                             table_is_fresh = true;
-                            emit_log(
-                                &app_c,
-                                "warning",
-                                format!(
+                            schema_drift_tables_c
+                                .lock()
+                                .unwrap_or_else(|p| p.into_inner())
+                                .insert(table_name.clone());
+                            let payload = LogPayload {
+                                r#type: "warning".to_string(),
+                                message: format!(
                                     "[Tabel '{}'] ⚠️ Terdeteksi perubahan struktur tabel di server (skema lokal tidak selaras). Otomatis dialihkan ke FRESH SYNC untuk menyelaraskan struktur & data!",
                                     table_name
                                 ),
-                            );
+                                timestamp: chrono::Local::now().format("%H:%M:%S").to_string(),
+                                details: Some("Perubahan struktur terdeteksi di server, tabel dialihkan ke fresh sync".to_string()),
+                                table_name: Some(table_name.clone()),
+                            };
+                            let _ = app_c.emit("sync-log", payload);
                         }
                     }
                 }
@@ -2104,6 +2114,13 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         &failures_consumer,
     );
 
+    let schema_drift_tables_list: Vec<String> = schema_drift_tables
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .cloned()
+        .collect();
+
     let result = SyncResult {
         success: status == "success",
         status: status.to_string(),
@@ -2126,9 +2143,11 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             _ => Some("Sinkronisasi berhenti sebelum semua tabel selesai".to_string()),
         },
         failures,
+        schema_drift_tables: schema_drift_tables_list,
     };
 
     let _ = app.emit("sync-finished", &result);
+
 
     let (log_type, summary) = match status {
         "success" => (

@@ -164,6 +164,8 @@ pub struct SyncResult {
     pub sync_timestamp_epoch_ms: Option<i64>,
     pub error: Option<String>,
     pub failures: Vec<SyncFailure>,
+    #[serde(default)]
+    pub schema_drift_tables: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

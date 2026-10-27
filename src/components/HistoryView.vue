@@ -191,12 +191,12 @@
             </div>
           </div>
 
-          <!-- Sync Logs -->
+          <!-- Sync Logs (Hanya Masalah & Peringatan, Info dilewati agar hemat memori) -->
           <div class="drawer-section">
             <div class="log-section-header" @click="logsExpanded = !logsExpanded">
               <div class="log-section-title">
                 <AlertCircle :size="13" />
-                <span>Log Sinkronisasi{{ selectedItemLogs.length > 0 ? ` (${selectedItemLogs.length})` : '' }}</span>
+                <span>Log Masalah & Peringatan{{ selectedItemLogs.length > 0 ? ` (${selectedItemLogs.length})` : '' }}</span>
                 <span class="log-count-pill error" v-if="errorLogCount > 0">{{ errorLogCount }} error</span>
                 <span class="log-count-pill warn" v-if="warnLogCount > 0">{{ warnLogCount }} warn</span>
               </div>
@@ -204,10 +204,10 @@
             </div>
 
             <div v-if="logsExpanded">
-              <!-- No logs stored (old entry) -->
+              <!-- No logs stored -->
               <div v-if="selectedItemLogs.length === 0" class="log-empty-state">
-                <span>Log tidak tersedia untuk riwayat ini.</span>
-                <span class="log-empty-hint">Log hanya tersimpan untuk sinkronisasi yang dijalankan setelah versi ini.</span>
+                <span>Tidak ada catatan error atau peringatan pada riwayat ini.</span>
+                <span class="log-empty-hint">Pencatatan log info dilewati agar hemat memori penyimpanan.</span>
               </div>
 
               <!-- Log list -->
@@ -237,15 +237,15 @@
             </div>
           </div>
 
-          <!-- Synced Tables List -->
+          <!-- Tabel Gagal & Perubahan Struktur (Hemat memori, abaikan tabel sukses) -->
           <div class="drawer-section">
             <div class="section-header-row">
               <div class="section-title">
                 <Database :size="13" />
-                <span>Daftar Tabel ({{ selectedItem.table_names?.length || selectedItem.tables_count || 0 }})</span>
+                <span>Tabel Gagal & Perubahan Struktur ({{ problematicTables.length }})</span>
               </div>
               <input
-                v-if="selectedItem.table_names && selectedItem.table_names.length > 5"
+                v-if="problematicTables.length > 5"
                 v-model="tableFilterQuery"
                 type="text"
                 placeholder="Cari tabel..."
@@ -255,15 +255,28 @@
 
             <div class="drawer-tables-scroll">
               <div
-                v-for="tName in filteredDrawerTables"
-                :key="tName"
-                class="drawer-table-row"
+                v-for="item in filteredProblematicTables"
+                :key="item.name"
+                class="drawer-table-row problem-row"
+                :class="item.status"
               >
-                <span class="tbl-bullet">•</span>
-                <span class="tbl-name">{{ tName }}</span>
+                <div class="table-name-group">
+                  <span class="tbl-bullet" :class="item.status">•</span>
+                  <span class="tbl-name">{{ item.name }}</span>
+                </div>
+                <div class="table-meta-group">
+                  <span class="table-badge" :class="item.badgeClass">{{ item.badge }}</span>
+                </div>
               </div>
-              <div v-if="filteredDrawerTables.length === 0" class="drawer-table-empty">
-                Tidak ada data tabel tersimpan untuk riwayat ini.
+              <div v-if="filteredProblematicTables.length === 0" class="drawer-table-empty">
+                <div v-if="problematicTables.length === 0" class="empty-success-msg">
+                  <CheckCircle2 :size="15" style="color: var(--primary-green); margin-bottom: 2px;" />
+                  <div>Semua tabel berhasil disinkronkan tanpa error.</div>
+                  <div class="empty-hint">Tidak ada tabel gagal atau tabel yang perlu di-fresh ulang. Nama tabel sukses tidak disimpan untuk menghemat memori penyimpanan.</div>
+                </div>
+                <div v-else>
+                  Tabel tidak ditemukan dalam pencarian.
+                </div>
               </div>
             </div>
           </div>
@@ -319,9 +332,9 @@ const selectedItem = ref(null);
 const tableFilterQuery = ref('');
 const logsExpanded = ref(true);
 
-// Computed: logs for currently selected history item
+// Computed: logs for currently selected history item (filter out info logs to prevent bloat)
 const selectedItemLogs = computed(() => {
-  return selectedItem.value?.logs || [];
+  return (selectedItem.value?.logs || []).filter((l) => l.type !== 'info');
 });
 
 const errorLogCount = computed(() =>
@@ -336,11 +349,70 @@ const totalRowsCopied = computed(() => {
   return props.historyList.reduce((sum, item) => sum + (Number(item.rows_copied) || 0), 0);
 });
 
-const filteredDrawerTables = computed(() => {
-  const list = selectedItem.value?.table_names || [];
+function extractTableName(msg) {
+  if (!msg) return null;
+  const match = msg.match(/\[Tabel ['"]?([^'"\]]+)['"]?\]/);
+  return match ? match[1] : null;
+}
+
+// Extract failed table names
+const failedTablesList = computed(() => {
+  if (!selectedItem.value) return [];
+  const fromField = selectedItem.value.failed_tables || [];
+  const fromFailures = (selectedItem.value.failures || [])
+    .map((f) => f.table_name)
+    .filter(Boolean);
+  return [...new Set([...fromField, ...fromFailures])];
+});
+
+// Extract structure-changed (schema drift) table names that needed fresh sync
+const structureChangedTablesList = computed(() => {
+  if (!selectedItem.value) return [];
+  const fromField = selectedItem.value.structure_changed_tables || [];
+  const fromLogs = (selectedItem.value.logs || [])
+    .filter((l) =>
+      l.message && (
+        l.message.includes('perubahan struktur') ||
+        l.message.includes('skema lokal tidak selaras')
+      )
+    )
+    .map((l) => l.table_name || extractTableName(l.message))
+    .filter(Boolean);
+  return [...new Set([...fromField, ...fromLogs])];
+});
+
+// Combined list of problematic/changed tables
+const problematicTables = computed(() => {
+  const result = [];
+  const failedSet = new Set(failedTablesList.value);
+  for (const name of failedTablesList.value) {
+    result.push({
+      name,
+      status: 'failed',
+      badge: '✕ Gagal',
+      badgeClass: 'badge-failed',
+      note: 'Gagal saat sinkronisasi',
+    });
+  }
+  for (const name of structureChangedTablesList.value) {
+    if (!failedSet.has(name)) {
+      result.push({
+        name,
+        status: 'structure_drift',
+        badge: '⚠️ Perubahan Struktur',
+        badgeClass: 'badge-changed',
+        note: 'Skema berubah di server, di-fresh sync',
+      });
+    }
+  }
+  return result;
+});
+
+const filteredProblematicTables = computed(() => {
+  const list = problematicTables.value;
   if (!tableFilterQuery.value.trim()) return list;
   const q = tableFilterQuery.value.trim().toLowerCase();
-  return list.filter((t) => t.toLowerCase().includes(q));
+  return list.filter((t) => t.name.toLowerCase().includes(q));
 });
 
 function triggerRerun() {
@@ -622,7 +694,7 @@ onBeforeUnmount(() => {
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 3px 6px;
+  padding: 4px 6px;
   border-radius: 4px;
   font-family: var(--font-mono);
   font-size: 0.71875rem;
@@ -633,8 +705,53 @@ onBeforeUnmount(() => {
   background: #ffffff;
 }
 
+.drawer-table-row.problem-row {
+  justify-content: space-between;
+}
+
+.table-name-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.table-meta-group {
+  display: flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+
+.table-badge {
+  font-size: 0.625rem;
+  font-weight: 700;
+  padding: 1px 6px;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
+.table-badge.badge-failed {
+  background: #fee2e2;
+  color: #b91c1c;
+  border: 1px solid #fecaca;
+}
+
+.table-badge.badge-changed {
+  background: #fef3c7;
+  color: #92400e;
+  border: 1px solid #fde68a;
+}
+
 .tbl-bullet {
   color: var(--primary-green);
+}
+
+.tbl-bullet.failed {
+  color: #ef4444;
+}
+
+.tbl-bullet.structure_drift {
+  color: #f59e0b;
 }
 
 .tbl-name {
@@ -646,7 +763,22 @@ onBeforeUnmount(() => {
   text-align: center;
   color: #94a3b8;
   font-size: 0.71875rem;
-  font-style: italic;
+}
+
+.empty-success-msg {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  color: #475569;
+  font-style: normal;
+}
+
+.empty-success-msg .empty-hint {
+  font-size: 0.6875rem;
+  color: #94a3b8;
+  max-width: 290px;
+  line-height: 1.35;
 }
 
 .drawer-footer {

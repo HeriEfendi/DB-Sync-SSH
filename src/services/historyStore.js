@@ -27,14 +27,23 @@ export function saveSyncHistory(history) {
 
 export function addHistoryEntry(entry) {
   const current = getSyncHistory();
+  // Sanitize entry: exclude info logs to save memory
+  const sanitizedEntry = {
+    ...entry,
+    logs: Array.isArray(entry.logs)
+      ? entry.logs.filter((l) => l.type !== 'info')
+      : [],
+  };
+
   const updated = [
     {
       id: `hist-${Date.now()}`,
       timestamp: new Date().toLocaleString(),
-      ...entry,
+      ...sanitizedEntry,
     },
     ...current,
-  ];
+  ].slice(0, 50); // Simpan maksimal 50 riwayat terakhir untuk hemat memori
+
   saveSyncHistory(updated);
   return updated;
 }
