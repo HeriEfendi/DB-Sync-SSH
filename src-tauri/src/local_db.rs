@@ -21,6 +21,27 @@ pub fn build_local_connection_string(config: &LocalDbConfig) -> String {
     )
 }
 
+pub(crate) fn format_local_mysql_connection_error(
+    context: &str,
+    error: impl std::fmt::Display,
+) -> String {
+    let detail = error.to_string();
+    let mut message = format!("{}: {}", context, detail);
+
+    if detail.to_ascii_lowercase().contains("auth_gssapi_client") {
+        message.push_str(
+            ". Server lokal memakai plugin autentikasi auth_gssapi_client yang belum didukung \
+             driver MySQL aplikasi (SQLx). Buat akun MariaDB khusus aplikasi dengan \
+             mysql_native_password, beri hak akses ke database lokal, lalu gunakan akun itu \
+             pada profil. Contoh: CREATE USER 'db_sync_app'@'127.0.0.1' IDENTIFIED VIA \
+             mysql_native_password USING PASSWORD('GANTI_PASSWORD'); GRANT ALL PRIVILEGES ON \
+             nama_database.* TO 'db_sync_app'@'127.0.0.1'; Koneksi SSH tidak perlu diubah.",
+        );
+    }
+
+    message
+}
+
 pub fn sanitize_identifier(ident: &str) -> Result<String, String> {
     let trimmed = ident.trim().trim_matches('`');
     if trimmed.is_empty() {
@@ -202,7 +223,7 @@ pub async fn test_local_connection(config: &LocalDbConfig) -> Result<String, Str
         .max_connections(2)
         .connect(&conn_str)
         .await
-        .map_err(|e| format!("Gagal terhubung ke MySQL lokal: {}", e))?;
+        .map_err(|e| format_local_mysql_connection_error("Gagal terhubung ke MySQL lokal", e))?;
 
     let row: (String,) = sqlx::query_as("SELECT VERSION()")
         .fetch_one(&pool)
@@ -241,7 +262,22 @@ pub async fn ensure_local_database_exists(config: &LocalDbConfig) -> Result<(), 
         .max_connections(2)
         .connect(&root_conn_str)
         .await
-        .map_err(|e| format!("Gagal terhubung ke MySQL server lokal: {}", e))?;
+        .map_err(|e| {
+            format_local_mysql_connection_error("Gagal terhubung ke MySQL server lokal", e)
+        })?;
+
+    let database_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = ?",
+    )
+    .bind(&config.database)
+    .fetch_one(&pool)
+    .await
+    .map_err(|e| format!("Gagal memeriksa database lokal '{}': {}", config.database, e))?;
+
+    if database_count > 0 {
+        pool.close().await;
+        return Ok(());
+    }
 
     sqlx::query(&create_sql)
         .execute(&pool)
@@ -370,7 +406,7 @@ pub async fn get_local_tables(config: &LocalDbConfig) -> Result<Vec<String>, Str
         .max_connections(2)
         .connect(&conn_str)
         .await
-        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+        .map_err(|e| format_local_mysql_connection_error("Koneksi ke MySQL lokal gagal", e))?;
 
     let rows = sqlx::query("SELECT TABLE_NAME FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_TYPE = 'BASE TABLE' ORDER BY TABLE_NAME ASC")
         .fetch_all(&pool)
@@ -400,7 +436,12 @@ pub async fn get_all_tables_last_local_ids(
         .await
     {
         Ok(p) => p,
-        Err(e) => return Err(format!("Koneksi ke MySQL lokal gagal: {}", e)),
+        Err(e) => {
+            return Err(format_local_mysql_connection_error(
+                "Koneksi ke MySQL lokal gagal",
+                e,
+            ))
+        }
     };
 
     // 1. Get primary keys for tables in the local database
@@ -503,12 +544,12 @@ pub async fn drop_local_tables(
         .acquire_timeout(std::time::Duration::from_secs(6))
         .connect(&conn_str)
         .await
-        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+        .map_err(|e| format_local_mysql_connection_error("Koneksi ke MySQL lokal gagal", e))?;
 
     let mut conn = pool
         .acquire()
         .await
-        .map_err(|e| format!("Koneksi ke MySQL lokal gagal: {}", e))?;
+        .map_err(|e| format_local_mysql_connection_error("Koneksi ke MySQL lokal gagal", e))?;
 
     let _ = sqlx::query("SET FOREIGN_KEY_CHECKS=0").execute(&mut *conn).await;
 
@@ -535,7 +576,9 @@ pub async fn drop_local_tables(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_create_database_sql, validate_docker_container};
+    use super::{
+        build_create_database_sql, format_local_mysql_connection_error, validate_docker_container,
+    };
     use crate::models::LocalDbConfig;
 
     fn local_config(docker_container: &str) -> LocalDbConfig {
@@ -574,6 +617,27 @@ mod tests {
         assert_eq!(
             validate_docker_container(&local_config("  local-mysql  ")).unwrap(),
             "local-mysql"
+        );
+    }
+
+    #[test]
+    fn gssapi_connection_error_explains_supported_local_authentication() {
+        let error = format_local_mysql_connection_error(
+            "Gagal terhubung ke MySQL lokal",
+            "unknown authentication plugin: auth_gssapi_client",
+        );
+
+        assert!(error.contains("auth_gssapi_client"));
+        assert!(error.contains("mysql_native_password"));
+        assert!(error.contains("CREATE USER 'db_sync_app'@'127.0.0.1'"));
+        assert!(error.contains("Koneksi SSH tidak perlu diubah"));
+    }
+
+    #[test]
+    fn other_connection_errors_are_preserved_without_extra_guidance() {
+        assert_eq!(
+            format_local_mysql_connection_error("Koneksi gagal", "connection refused"),
+            "Koneksi gagal: connection refused"
         );
     }
 }

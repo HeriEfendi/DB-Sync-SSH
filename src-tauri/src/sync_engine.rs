@@ -1,6 +1,6 @@
 use crate::local_db::{
-    build_local_connection_string, ensure_local_database_exists, sanitize_identifier,
-    spawn_mysql_child,
+    build_local_connection_string, ensure_local_database_exists,
+    format_local_mysql_connection_error, sanitize_identifier, spawn_mysql_child,
 };
 use crate::models::{
     incremental_primary_key, LocalDbConfig, LogPayload, ProgressPayload, RemoteDbConfig, SshConfig,
@@ -536,7 +536,9 @@ pub async fn compare_table_counts(
             .acquire_timeout(std::time::Duration::from_secs(6))
             .connect(&conn_str)
             .await
-            .map_err(|e| format!("Gagal terhubung ke MySQL lokal: {}", e))?;
+            .map_err(|e| {
+                format_local_mysql_connection_error("Gagal terhubung ke MySQL lokal", e)
+            })?;
 
         let rows = sqlx::query(
             "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) AS total_rows 
@@ -1059,7 +1061,12 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         .acquire_timeout(std::time::Duration::from_secs(8))
         .connect(&local_connection_string)
         .await
-        .map_err(|e| format!("Gagal terhubung untuk memeriksa skema MySQL lokal: {}", e))?;
+        .map_err(|e| {
+            format_local_mysql_connection_error(
+                "Gagal terhubung untuk memeriksa skema MySQL lokal",
+                e,
+            )
+        })?;
 
     // 1. Batch query local schema column metadata
     let local_columns_query = "

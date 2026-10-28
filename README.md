@@ -157,6 +157,21 @@ Dirancang untuk menyinkronkan database MySQL / MariaDB remote secara aman melalu
    * Binary `mysql` atau `mariadb` CLI terpasang pada `PATH` (atau engine Docker aktif jika menggunakan mode container).
 4. **Sistem Operasi**: Linux, macOS, atau Windows.
 
+### Masalah autentikasi MariaDB lokal di Windows
+
+Jika koneksi SSH berhasil tetapi tes koneksi lokal menampilkan `unknown authentication plugin: auth_gssapi_client`, akun MariaDB yang dipakai sedang menggunakan autentikasi GSSAPI. Aplikasi menggunakan driver SQLx yang tidak mendukung plugin tersebut. Ini bukan masalah koneksi SSH, dan bukan berarti semua instalasi MariaDB Windows akan gagal; akun dengan plugin autentikasi lain tetap dapat digunakan.
+
+Buat database jika belum ada dan akun terpisah untuk aplikasi menggunakan MariaDB client sebagai administrator. Ganti `nama_database` dan `GANTI_PASSWORD` dengan nilai sendiri:
+
+```sql
+CREATE DATABASE IF NOT EXISTS `nama_database`;
+CREATE USER 'db_sync_app'@'127.0.0.1'
+  IDENTIFIED VIA mysql_native_password USING PASSWORD('GANTI_PASSWORD');
+GRANT ALL PRIVILEGES ON `nama_database`.* TO 'db_sync_app'@'127.0.0.1';
+```
+
+Jika akun sudah ada, gunakan nama akun lain atau ubah plugin akunnya secara sengaja; jangan jalankan `CREATE USER` berulang. Isi profil aplikasi dengan host `127.0.0.1`, username `db_sync_app`, password yang sama, dan database yang dibuat. Jangan mengubah konfigurasi SSH atau plugin akun administrator yang sudah ada.
+
 ---
 
 ## 💻 Menjalankan & Membangun Aplikasi
