@@ -10,6 +10,7 @@ use crate::ssh_client::{establish_ssh_session, start_ssh_tunnel};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::Row;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -759,7 +760,7 @@ static DUMP_COMPRESSION_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::Once
 
 fn get_dump_compression_args(dump_bin: &str) -> &'static [String] {
     DUMP_COMPRESSION_ARGS.get_or_init(|| {
-        let mut check_cmd = std::process::Command::new(dump_bin);
+        let mut check_cmd = crate::process_utils::new_std_command(dump_bin);
         check_cmd.arg("--help");
         if let Ok(output) = check_cmd.output() {
             let help_text = String::from_utf8_lossy(&output.stdout);
@@ -780,6 +781,7 @@ async fn stream_dump_to_local_importer<R: tauri::Runtime>(
     remote_db_config: &RemoteDbConfig,
     table_name: &str,
     table_index: usize,
+    dump_binary: &Path,
     where_clause: &str,
     use_replace: bool,
     local_stdin: &mut tokio::process::ChildStdin,
@@ -791,12 +793,8 @@ async fn stream_dump_to_local_importer<R: tauri::Runtime>(
     start_time: Instant,
     failures: &Arc<Mutex<Vec<SyncFailure>>>,
 ) -> Result<usize, String> {
-    let dump_bin = if std::path::Path::new("/usr/bin/mariadb-dump").exists() {
-        "mariadb-dump"
-    } else {
-        "mysqldump"
-    };
-    let mut dump_cmd = crate::process_utils::new_tokio_command(dump_bin);
+    let dump_bin = dump_binary.to_string_lossy();
+    let mut dump_cmd = crate::process_utils::new_tokio_command(dump_binary);
     dump_cmd
         .arg("-h")
         .arg("127.0.0.1")
@@ -810,7 +808,7 @@ async fn stream_dump_to_local_importer<R: tauri::Runtime>(
         .arg("--single-transaction");
 
     // Smart Low-CPU Compression (zstd level 1 with zlib / compress fallback)
-    for arg in get_dump_compression_args(dump_bin) {
+    for arg in get_dump_compression_args(&dump_bin) {
         dump_cmd.arg(arg);
     }
 
@@ -1004,7 +1002,38 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         "🚀 Memulai inisialisasi sinkronisasi DB over SSH...",
     );
 
+    emit_log(
+        &app,
+        "info",
+        "🔎 Memeriksa MySQL/MariaDB client lokal yang diperlukan untuk import...",
+    );
+    if !local_db_config.use_docker {
+        if let Err(error) =
+            crate::process_utils::resolve_mysql_binary(&["mariadb", "mysql"])
+        {
+            emit_log(&app, "error", &error);
+            return Err(error);
+        }
+    }
+    let remote_dump_binary = if sync_options.tables.iter().any(|table| table.sync_data) {
+        match crate::process_utils::resolve_mysql_binary(&["mariadb-dump", "mysqldump"]) {
+            Ok(binary) => Some(binary),
+            Err(error) => {
+                emit_log(&app, "error", &error);
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    emit_log(
+        &app,
+        "success",
+        "✅ MySQL/MariaDB client yang diperlukan tersedia.",
+    );
+
     // 1. Ensure local database exists
+    emit_log(&app, "info", "🗄️ Memastikan database MySQL lokal siap...");
     if let Err(e) = ensure_local_database_exists(&local_db_config).await {
         emit_log(
             &app,
@@ -1038,6 +1067,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         remote_db_config.database
     );
 
+    emit_log(&app, "info", "🔗 Tunnel SSH siap; menghubungkan ke MySQL remote...");
     let remote_pool = match MySqlPoolOptions::new()
         .max_connections(6)
         .acquire_timeout(std::time::Duration::from_secs(15))
@@ -1056,6 +1086,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     };
 
     let local_connection_string = build_local_connection_string(&local_db_config);
+    emit_log(&app, "info", "📋 Membaca metadata skema database lokal...");
     let local_schema_pool = MySqlPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(8))
@@ -1099,8 +1130,10 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     }
     let existing_local_tables = Arc::new(existing_local_tables);
     let local_schema_signatures = Arc::new(local_schema_signatures);
+    emit_log(&app, "success", "✅ Metadata skema lokal selesai dibaca.");
 
     // 2. Batch query remote schema metadata: PKs, updated_at columns, and full schema signatures
+    emit_log(&app, "info", "📋 Membaca metadata skema database remote...");
     let remote_columns_query = "
         SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_TYPE, IS_NULLABLE, COLUMN_KEY
         FROM information_schema.COLUMNS 
@@ -1154,6 +1187,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let pk_map = Arc::new(pk_map);
     let tables_with_updated_at = Arc::new(tables_with_updated_at);
     let remote_schema_signatures = Arc::new(remote_schema_signatures);
+    emit_log(&app, "success", "✅ Metadata remote selesai; menyiapkan daftar tabel...");
 
     let (sync_timestamp, sync_timestamp_epoch_ms): (String, i64) = sqlx::query_as(
         "SELECT DATE_FORMAT(CURRENT_TIMESTAMP(6), '%Y-%m-%d %H:%i:%s.%f'), CAST(UNIX_TIMESTAMP(CURRENT_TIMESTAMP(6)) * 1000 AS SIGNED)",
@@ -1170,6 +1204,11 @@ pub async fn run_sync_task<R: tauri::Runtime>(
     let mut pre_skipped_set = HashSet::new();
     if !is_fresh {
         if let Some(ref wm_map) = sync_options.incremental_watermarks {
+            emit_log(
+                &app,
+                "info",
+                "🔍 Memeriksa perubahan incremental pada tabel-tabel terpilih...",
+            );
             struct WatermarkCandidate {
                 table_name: String,
                 safe_table: String,
@@ -1287,6 +1326,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
             }
         }
     }
+    emit_log(&app, "success", "✅ Pemeriksaan awal tabel selesai; menyiapkan worker sinkronisasi...");
     let pre_skipped_tables = Arc::new(pre_skipped_set);
 
     let pipeline_concurrency = sync_options
@@ -1351,6 +1391,7 @@ pub async fn run_sync_task<R: tauri::Runtime>(
         let skipped_table_names_c = skipped_table_names.clone();
         let schema_drift_tables_c = schema_drift_tables.clone();
         let row_limit_opt = sync_options.row_limit;
+        let dump_binary_c = remote_dump_binary.clone();
         let total_tables_c = total_tables;
         let started_at_c = start_time;
 
@@ -1864,12 +1905,28 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         ),
                     );
 
+                    let dump_binary = match dump_binary_c.as_deref() {
+                        Some(binary) => binary,
+                        None => {
+                            let error = "Executable dump MySQL remote tidak disiapkan untuk sinkronisasi data.";
+                            record_failure(
+                                &app_c,
+                                &failures_c,
+                                Some(table_name),
+                                "Menyiapkan importer data remote",
+                                error,
+                            );
+                            fatal_failure_c.store(true, Ordering::SeqCst);
+                            break;
+                        }
+                    };
                     match stream_dump_to_local_importer(
                         &app_c,
                         tunnel_port,
                         &remote_cfg_c,
                         table_name,
                         idx + 1,
+                        dump_binary,
                         &where_clause,
                         !table_is_fresh,
                         &mut local_stdin,

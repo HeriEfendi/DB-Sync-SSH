@@ -342,13 +342,7 @@ pub fn spawn_mysql_child(
             local_config.port
         };
 
-        // Check if mariadb or mysql cli binary is available
-        let binary = if std::path::Path::new("/usr/bin/mariadb").exists() {
-            "mariadb"
-        } else {
-            "mysql"
-        };
-
+        let binary = crate::process_utils::resolve_mysql_binary(&["mariadb", "mysql"])?;
         let mut c = new_tokio_command(binary);
         c.arg("-h")
             .arg(host)
