@@ -53,6 +53,11 @@
             <div class="progress-bar-fill" :style="{ width: percentComplete + '%' }"></div>
           </div>
 
+          <div v-if="!isFinished" class="sync-activity" role="status" aria-live="polite">
+            <span class="sync-activity-spinner"></span>
+            <span><strong>Aktivitas:</strong> {{ currentActivity }}</span>
+          </div>
+
           <div class="sync-live-stats">
             <div class="sync-live-stat">
               <span>Durasi berjalan</span>
@@ -448,6 +453,13 @@ const elapsedMilliseconds = computed(() => {
 });
 
 const elapsedLabel = computed(() => formatDuration(elapsedMilliseconds.value));
+
+const currentActivity = computed(() => {
+  const latestActivity = [...props.logs]
+    .reverse()
+    .find((log) => log.type === 'info' || log.type === 'success');
+  return latestActivity?.message || 'Menyiapkan sinkronisasi...';
+});
 
 function toggleLog(log, idx) {
   const key = getLogKey(log, idx);
