@@ -1270,6 +1270,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                 // Batch up to 40 tables per UNION ALL query to eliminate SSH round-trip latency
                 const BATCH_SIZE: usize = 40;
                 for chunk in candidates.chunks(BATCH_SIZE) {
+                    if is_cancelled() {
+                        break;
+                    }
                     let union_sql = chunk
                         .iter()
                         .map(|c| {
@@ -1282,8 +1285,9 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                         .collect::<Vec<_>>()
                         .join(" UNION ALL ");
 
-                    match sqlx::query(&union_sql).fetch_all(&*remote_pool).await {
-                        Ok(rows) => {
+                    let query_fut = sqlx::query(&union_sql).fetch_all(&*remote_pool);
+                    match tokio::time::timeout(std::time::Duration::from_secs(10), query_fut).await {
+                        Ok(Ok(rows)) => {
                             let mut changed_tables = HashSet::new();
                             for r in rows {
                                 if let Ok(tbl) = r.try_get::<String, _>("_tbl") {
@@ -1296,18 +1300,11 @@ pub async fn run_sync_task<R: tauri::Runtime>(
                                 }
                             }
                         }
-                        Err(err) => {
-                            eprintln!("[BatchWatermarkCheck] Batch query failed, falling back to individual checks: {}", err);
-                            // Fallback to individual checks for this chunk
-                            for c in chunk {
-                                let single_sql = format!(
-                                    "SELECT 1 FROM {} WHERE ({}) LIMIT 1",
-                                    c.safe_table, c.cond
-                                );
-                                if let Ok(None) = sqlx::query(&single_sql).fetch_optional(&*remote_pool).await {
-                                    pre_skipped_set.insert(c.table_name.clone());
-                                }
-                            }
+                        Ok(Err(err)) => {
+                            eprintln!("[BatchWatermarkCheck] Batch query failed, skipping fast-check for this batch: {}", err);
+                        }
+                        Err(_) => {
+                            eprintln!("[BatchWatermarkCheck] Batch query timed out (>10s), continuing to worker pipeline");
                         }
                     }
                 }
