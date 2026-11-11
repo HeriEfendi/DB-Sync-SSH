@@ -12,10 +12,14 @@
 @import "./buttons.css";
 @import "./forms.css";
 @import "./tables.css";
+@import "./table-toolbar.css";
 @import "./sidebar.css";
 @import "./modals.css";
 @import "./status.css";
 @import "./widget.css";
 @import "./history.css";
+@import "./history-drawer.css";
+@import "./history-log.css";
 @import "./diff-modal.css";
 @import "./sync-modal.css";
+@import "./sync-terminal.css";
