@@ -124,6 +124,7 @@ import {
   X,
   Square,
 } from 'lucide-vue-next';
+import { formatNumber } from '../utils/formatters.js';
 
 const props = defineProps({
   profileName: { type: String, default: '' },
@@ -152,8 +153,6 @@ const emit = defineEmits(['expand', 'stop-sync', 'dismiss']);
 
 const currentTime = ref(Date.now());
 let timer = null;
-
-// 5-second auto dismiss timer
 const dismissCountdown = ref(5);
 let countdownInterval = null;
 const isHovered = ref(false);
@@ -164,7 +163,7 @@ function startAutoDismiss() {
   dismissCountdown.value = 5;
 
   countdownInterval = setInterval(() => {
-    if (isHovered.value) return; // Jeda hitung mundur jika mouse sedang berada di widget
+    if (isHovered.value) return;
     dismissCountdown.value -= 1;
     if (dismissCountdown.value <= 0) {
       clearAutoDismiss();
@@ -231,266 +230,8 @@ const elapsedLabel = computed(() => {
   const seconds = totalSeconds % 60;
   return `${minutes}m ${String(seconds).padStart(2, '0')}s`;
 });
-
-function formatNumber(n) {
-  const value = Number(n);
-  if (!Number.isFinite(value)) return '0';
-  return Math.trunc(value).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
-}
 </script>
 
 <style scoped>
-.mini-floating-widget {
-  position: fixed;
-  bottom: 1.5rem;
-  right: 1.5rem;
-  width: 330px;
-  background: rgba(255, 255, 255, 0.96);
-  backdrop-filter: blur(10px);
-  -webkit-backdrop-filter: blur(10px);
-  border: 1px solid #cbd5e1;
-  border-radius: 10px;
-  box-shadow: 0 10px 25px -5px rgba(15, 23, 42, 0.15), 0 8px 10px -6px rgba(15, 23, 42, 0.1);
-  z-index: 1050;
-  overflow: hidden;
-  display: flex;
-  flex-direction: column;
-  animation: slideUpFade 0.25s cubic-bezier(0.16, 1, 0.3, 1);
-  font-family: var(--font-sans);
-}
-
-@keyframes slideUpFade {
-  from {
-    opacity: 0;
-    transform: translateY(16px);
-  }
-  to {
-    opacity: 1;
-    transform: translateY(0);
-  }
-}
-
-.widget-success {
-  border-color: #a7f3d0;
-  background: #f0fdf4;
-}
-
-.widget-partial {
-  border-color: #fde68a;
-  background: #fffbeb;
-}
-
-.widget-failed {
-  border-color: #fecaca;
-  background: #fef2f2;
-}
-
-.widget-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 0.625rem 0.75rem 0.5rem;
-  gap: 0.5rem;
-}
-
-.widget-status-badge {
-  display: flex;
-  align-items: center;
-  gap: 0.5rem;
-  min-width: 0;
-  flex: 1;
-}
-
-.widget-spinner-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  background-color: #10b981;
-  animation: pulseGreen 1.5s infinite;
-  display: inline-block;
-  flex-shrink: 0;
-}
-
-@keyframes pulseGreen {
-  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); }
-  70% { transform: scale(1); box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
-  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
-}
-
-.icon-success { color: #059669; flex-shrink: 0; }
-.icon-warning { color: #d97706; flex-shrink: 0; }
-.icon-error { color: #dc2626; flex-shrink: 0; }
-
-.widget-title {
-  font-size: 0.78125rem;
-  font-weight: 600;
-  color: #0f172a;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
-
-.widget-actions {
-  display: flex;
-  align-items: center;
-  gap: 4px;
-}
-
-.widget-btn-icon {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 24px;
-  height: 24px;
-  border-radius: 4px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: #64748b;
-  cursor: pointer;
-  transition: all 0.15s ease;
-}
-
-.widget-btn-icon:hover {
-  background: #e2e8f0;
-  color: #0f172a;
-}
-
-.widget-btn-stop:hover {
-  background: #fee2e2;
-  color: #dc2626;
-  border-color: #fca5a5;
-}
-
-.widget-progress-track {
-  width: 100%;
-  height: 3px;
-  background-color: #e2e8f0;
-  overflow: hidden;
-}
-
-.widget-progress-fill {
-  height: 100%;
-  background: linear-gradient(90deg, #10b981, #059669);
-  transition: width 0.3s ease;
-}
-
-.widget-body {
-  padding: 0.5rem 0.75rem 0.625rem;
-  display: flex;
-  flex-direction: column;
-  gap: 0.375rem;
-}
-
-.widget-info-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  font-size: 0.75rem;
-}
-
-.widget-current-table {
-  font-family: var(--font-mono);
-  font-size: 0.71875rem;
-  color: #334155;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  max-width: 200px;
-}
-
-.widget-current-table strong {
-  color: #0e7548;
-}
-
-.widget-progress-text {
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
-  font-weight: 600;
-  color: #475569;
-  flex-shrink: 0;
-}
-
-.widget-result-summary {
-  font-size: 0.75rem;
-  font-weight: 600;
-  color: #0f172a;
-}
-
-.widget-duration {
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
-  color: #64748b;
-}
-
-.widget-footer-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 0.5rem;
-  font-size: 0.6875rem;
-}
-
-.widget-stats-pill,
-.widget-time-pill {
-  font-family: var(--font-mono);
-  font-size: 0.6875rem;
-  color: #475569;
-  background: #f1f5f9;
-  padding: 2px 6px;
-  border-radius: 4px;
-}
-
-.widget-link-btn {
-  background: transparent;
-  border: none;
-  color: #0e7548;
-  font-size: 0.71875rem;
-  font-weight: 600;
-  cursor: pointer;
-  padding: 0;
-  margin-left: auto;
-}
-
-.widget-link-btn:hover {
-  text-decoration: underline;
-}
-
-.dismiss-counter-badge {
-  font-size: 0.625rem;
-  font-family: var(--font-mono);
-  font-weight: 700;
-  background: rgba(15, 23, 42, 0.08);
-  color: #475569;
-  padding: 1px 6px;
-  border-radius: 99px;
-  letter-spacing: 0.02em;
-}
-
-.dismiss-progress-track {
-  width: 100%;
-  height: 2.5px;
-  background-color: rgba(0, 0, 0, 0.06);
-  overflow: hidden;
-}
-
-.dismiss-progress-fill {
-  height: 100%;
-  background: #10b981;
-  transition: width 1s linear;
-}
-
-.widget-partial .dismiss-progress-fill {
-  background: #f59e0b;
-}
-
-.widget-failed .dismiss-progress-fill {
-  background: #ef4444;
-}
-
-.widget-dismiss-hint {
-  font-size: 0.625rem;
-  color: #94a3b8;
-  font-style: italic;
-}
+/* Scoped styles migrated to src/styles/widget.css */
 </style>
