@@ -1,0 +1,52 @@
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  scrollbar-width: thin;
+  scrollbar-color: transparent transparent;
+}
+
+*.is-scrolling {
+  scrollbar-color: rgba(148, 163, 184, 0.6) transparent;
+}
+
+/* WebKit / Chromium / WebKitGTK Overlay Auto-Hide Scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background-color: transparent;
+  border-radius: 9999px;
+  transition: background-color 0.15s ease;
+}
+
+/* Auto-show scrollbar thumb only when actively scrolling */
+.is-scrolling::-webkit-scrollbar-thumb {
+  background-color: rgba(148, 163, 184, 0.55);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(100, 116, 139, 0.85);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: var(--bg-main);
+  color: var(--text-primary);
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+  user-select: none;
+}
+

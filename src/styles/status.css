@@ -1,0 +1,70 @@
+/* Status Badges & Indicators */
+.status-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 7px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+
+.status-badge.completed {
+  background-color: #ecfdf5;
+  color: #059669;
+  border: 1px solid #a7f3d0;
+}
+
+.status-badge.aborted {
+  background-color: #fffbeb;
+  color: #d97706;
+  border: 1px solid #fde68a;
+}
+
+.status-badge.partial {
+  background-color: #fffbeb;
+  color: #b45309;
+  border: 1px solid #fcd34d;
+}
+
+.status-badge.cancelled {
+  background-color: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+}
+
+.status-badge.failed {
+  background-color: #fef2f2;
+  color: #dc2626;
+  border: 1px solid #fecaca;
+}
+
+.history-count-badge {
+  font-size: 0.6875rem;
+  font-family: var(--font-mono);
+  font-weight: 500;
+  color: #64748b;
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  padding: 1px 6px;
+  border-radius: 4px;
+}
+
+.history-profile-cell {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.history-db-icon {
+  color: var(--primary-green);
+  flex-shrink: 0;
+}
+
+.history-profile-name {
+  font-weight: 600;
+  color: #0f172a;
+}
+
