@@ -19,7 +19,7 @@
             @click="$emit('minimize')"
           >
             <Minus :size="14" />
-            <span class="btn-label-hide-sm">Minimize</span>
+            <span class="btn-label-hide-sm"></span>
           </button>
           <button
             type="button"
