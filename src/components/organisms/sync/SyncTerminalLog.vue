@@ -1,5 +1,5 @@
 <template>
-  <div>
+  <div class="terminal-container">
     <!-- Terminal Console Toolbar -->
     <div class="terminal-toolbar">
       <div class="terminal-tabs">
@@ -61,7 +61,7 @@
 
         <button
           type="button"
-          class="terminal-btn-action"
+          class="terminal-action-btn"
           title="Salin seluruh log ke clipboard"
           @click="copyAllLogs"
         >
@@ -70,7 +70,7 @@
         </button>
         <button
           type="button"
-          class="terminal-btn-action"
+          class="terminal-action-btn"
           title="Download log sebagai file teks (Ctrl+S)"
           @click="exportLogsToFile"
         >
@@ -81,10 +81,10 @@
     </div>
 
     <!-- Terminal Box -->
-    <div class="terminal-scroll-wrapper">
+    <div class="terminal-wrapper">
       <div
         ref="terminalRef"
-        class="terminal-box"
+        class="terminal-console"
         role="log"
         aria-live="polite"
         @scroll.passive="onTerminalScroll"
@@ -97,7 +97,7 @@
         >
           <div class="log-main-line" @click="toggleLog(log, idx)">
             <span class="log-time">{{ log.timestamp }}</span>
-            <span class="log-text">{{ log.message }}</span>
+            <span class="log-text" :class="`log-msg-${log.type || 'info'}`">{{ log.message }}</span>
             <span v-if="log.details" class="log-details-toggle">
               {{ isLogExpanded(log, idx) ? '▲ Tutup' : '▼ Detail' }}
             </span>
@@ -110,16 +110,19 @@
           </div>
         </div>
 
-        <div v-if="filteredLogs.length === 0" class="terminal-empty-log">
+        <div v-if="filteredLogs.length === 0" class="log-empty-state">
           <span v-if="searchQuery">Tidak ada log yang cocok dengan kata kunci pencarian.</span>
           <span v-else>Belum ada rekaman log untuk filter ini.</span>
         </div>
+
+        <!-- Bottom spacer to ensure full visibility and prevent clipping -->
+        <div class="terminal-bottom-spacer" aria-hidden="true"></div>
       </div>
 
       <button
         v-if="!isAutoScrollEnabled"
         type="button"
-        class="jump-bottom-btn"
+        class="terminal-scroll-bottom-btn"
         @click="scrollToBottom"
       >
         <ArrowDown :size="12" />
@@ -206,7 +209,7 @@ function isLogExpanded(log, idx) {
 function onTerminalScroll() {
   if (!terminalRef.value) return;
   const { scrollTop, scrollHeight, clientHeight } = terminalRef.value;
-  isAutoScrollEnabled.value = scrollHeight - scrollTop - clientHeight < 35;
+  isAutoScrollEnabled.value = scrollHeight - scrollTop - clientHeight < 55;
 }
 
 function scrollToBottom() {
