@@ -209,7 +209,7 @@ function isLogExpanded(log, idx) {
 function onTerminalScroll() {
   if (!terminalRef.value) return;
   const { scrollTop, scrollHeight, clientHeight } = terminalRef.value;
-  isAutoScrollEnabled.value = scrollHeight - scrollTop - clientHeight < 55;
+  isAutoScrollEnabled.value = scrollHeight - scrollTop - clientHeight < 25;
 }
 
 function scrollToBottom() {
