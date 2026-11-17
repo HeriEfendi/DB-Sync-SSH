@@ -67,38 +67,123 @@ pub fn resolve_mysql_binary(names: &[&str]) -> Result<PathBuf, String> {
 
     #[cfg(windows)]
     {
-        for variable in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
-            if let Some(program_files) = std::env::var_os(variable) {
-                let program_files = PathBuf::from(program_files);
-                for vendor in ["MySQL", "MariaDB"] {
-                    if let Some(binary) =
-                        find_mysql_binary_in_tree(&program_files.join(vendor), &executable_names, 2)
-                    {
-                        candidates.push(binary);
+        // 1. Kumpulkan semua drive root yang terpasang (SystemDrive + C:\ s/d Z:\)
+        let mut drives = Vec::new();
+        if let Some(sys_drive) = std::env::var_os("SystemDrive") {
+            let drive_str = format!("{}\\", sys_drive.to_string_lossy().trim_end_matches('\\'));
+            drives.push(PathBuf::from(drive_str));
+        } else {
+            drives.push(PathBuf::from("C:\\"));
+        }
+
+        for letter in b'C'..=b'Z' {
+            let drive_path = PathBuf::from(format!("{}:\\", letter as char));
+            if drive_path.is_dir() && !drives.contains(&drive_path) {
+                drives.push(drive_path);
+            }
+        }
+
+        // 2. Kumpulkan folder Program Files (resmi MariaDB / MySQL installer)
+        let mut program_dirs = Vec::new();
+        for var in ["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"] {
+            if let Some(val) = std::env::var_os(var) {
+                let p = PathBuf::from(val);
+                if p.is_dir() && !program_dirs.contains(&p) {
+                    program_dirs.push(p);
+                }
+            }
+        }
+        for drive in &drives {
+            for sub in ["Program Files", "Program Files (x86)"] {
+                let p = drive.join(sub);
+                if p.is_dir() && !program_dirs.contains(&p) {
+                    program_dirs.push(p);
+                }
+            }
+        }
+
+        // MSI MariaDB memasang ke folder berversi seperti "MariaDB 10.4", "MariaDB 10.11", "MariaDB 11.4"
+        // MSI MySQL memasang ke "MySQL/MySQL Server 8.0" atau "MySQL Server 8.0"
+        for p_dir in &program_dirs {
+            if let Ok(entries) = std::fs::read_dir(p_dir) {
+                for entry in entries.flatten() {
+                    let is_dir = entry.file_type().map(|k| k.is_dir()).unwrap_or(false);
+                    if !is_dir {
+                        continue;
+                    }
+                    let folder_name = entry.file_name();
+                    let name_lower = folder_name.to_string_lossy().to_ascii_lowercase();
+                    if name_lower.starts_with("mariadb") || name_lower.starts_with("mysql") {
+                        let bin_dir = entry.path().join("bin");
+                        for name in &executable_names {
+                            candidates.push(bin_dir.join(name));
+                        }
+                        if let Some(binary) = find_mysql_binary_in_tree(&entry.path(), &executable_names, 2) {
+                            candidates.push(binary);
+                        }
                     }
                 }
             }
         }
 
-        let system_drive = std::env::var_os("SystemDrive")
-            .map(|drive| PathBuf::from(format!("{}\\", drive.to_string_lossy())))
-            .unwrap_or_else(|| PathBuf::from("C:\\"));
-        let known_roots = [
-            system_drive.join("xampp/mysql/bin"),
-            system_drive.join("laragon/bin/mysql"),
-            system_drive.join("laragon/bin/mariadb"),
-            system_drive.join("wamp64/bin/mysql"),
-            system_drive.join("wamp64/bin/mariadb"),
-        ];
-        for root in known_roots {
-            if let Some(binary) = find_mysql_binary_in_tree(&root, &executable_names, 2) {
-                candidates.push(binary);
+        // 3. Lokasi stack umum (XAMPP, Laragon, WAMP, Standalone) di semua drive
+        for drive in &drives {
+            let direct_bins = [
+                drive.join("xampp/mysql/bin"),
+                drive.join("mariadb/bin"),
+                drive.join("mysql/bin"),
+            ];
+            for bin_path in direct_bins {
+                for name in &executable_names {
+                    candidates.push(bin_path.join(name));
+                }
             }
-            candidates.extend(
-                executable_names
-                    .iter()
-                    .map(|name| root.join("bin").join(name)),
-            );
+
+            let search_roots = [
+                drive.join("laragon/bin/mysql"),
+                drive.join("laragon/bin/mariadb"),
+                drive.join("wamp64/bin/mysql"),
+                drive.join("wamp64/bin/mariadb"),
+                drive.join("wamp/bin/mysql"),
+                drive.join("wamp/bin/mariadb"),
+                drive.join("xampp/mysql"),
+            ];
+            for root in search_roots {
+                if root.is_dir() {
+                    if let Some(binary) = find_mysql_binary_in_tree(&root, &executable_names, 2) {
+                        candidates.push(binary);
+                    }
+                    for name in &executable_names {
+                        candidates.push(root.join("bin").join(name));
+                    }
+                }
+            }
+        }
+
+        // 4. Package manager user profile (Scoop, Chocolatey, dsb)
+        if let Some(user_profile) = std::env::var_os("USERPROFILE") {
+            let up = PathBuf::from(user_profile);
+            let scoop_bins = [
+                up.join("scoop/apps/mariadb/current/bin"),
+                up.join("scoop/apps/mysql/current/bin"),
+                up.join("scoop/shims"),
+            ];
+            for sb in scoop_bins {
+                for name in &executable_names {
+                    candidates.push(sb.join(name));
+                }
+            }
+        }
+
+        let choco_bins = [
+            PathBuf::from("C:\\ProgramData\\chocolatey\\bin"),
+            PathBuf::from("C:\\tools\\mysql\\bin"),
+            PathBuf::from("C:\\tools\\mariadb\\bin"),
+        ];
+        for cb in choco_bins {
+            for name in &executable_names {
+                candidates.push(cb.join(name));
+            }
         }
     }
 
@@ -107,14 +192,13 @@ pub fn resolve_mysql_binary(names: &[&str]) -> Result<PathBuf, String> {
         .find(|candidate| candidate.is_file())
         .ok_or_else(|| {
             format!(
-                "MySQL/MariaDB client ({}) tidak ditemukan. Pastikan MySQL/MariaDB terpasang dan folder bin berisi executable tersebut ada di PATH. Di Windows, lokasi XAMPP, Laragon, WAMP, dan instalasi standar juga dicari; setelah mengubah PATH, buka ulang aplikasi.",
+                "MySQL/MariaDB client ({}) tidak ditemukan. Pastikan MySQL/MariaDB terpasang dan folder bin berisi executable tersebut ada di PATH. Di Windows, lokasi resmi MariaDB/MySQL (Program Files), XAMPP, Laragon, WAMP di semua drive juga dicari otomatis; setelah mengubah PATH atau memasang client, buka ulang aplikasi.",
                 executable_names.join(" atau ")
             )
         })
 }
 
-#[cfg(windows)]
-fn find_mysql_binary_in_tree(
+pub fn find_mysql_binary_in_tree(
     directory: &Path,
     executable_names: &[String],
     depth: usize,
@@ -134,16 +218,16 @@ fn find_mysql_binary_in_tree(
         if !entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
             continue;
         }
-        if let Some(binary) = find_mysql_binary_in_tree(&entry.path(), executable_names, depth - 1)
-        {
-            return Some(binary);
-        }
         let bin_directory = entry.path().join("bin");
         for name in executable_names {
             let candidate = bin_directory.join(name);
             if candidate.is_file() {
                 return Some(candidate);
             }
+        }
+        if let Some(binary) = find_mysql_binary_in_tree(&entry.path(), executable_names, depth - 1)
+        {
+            return Some(binary);
         }
     }
     None
@@ -159,5 +243,54 @@ pub fn tune_pipe_capacity<T: std::os::unix::io::AsRawFd>(target: &T, size_bytes:
         unsafe {
             libc::fcntl(fd, 1031, size_bytes as libc::c_int);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn test_find_mysql_binary_in_tree_mariadb_versioned_folder() {
+        let unique = format!("db_sync_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let temp_dir = std::env::temp_dir().join(unique);
+        let bin_dir = temp_dir.join("Program Files").join("MariaDB 10.11").join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let dummy_exe = bin_dir.join("mariadb");
+        fs::write(&dummy_exe, b"dummy").unwrap();
+
+        let found = find_mysql_binary_in_tree(
+            &temp_dir.join("Program Files").join("MariaDB 10.11"),
+            &["mariadb".to_string()],
+            2,
+        );
+
+        assert_eq!(found, Some(dummy_exe));
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn test_find_mysql_binary_in_tree_laragon_nested_folder() {
+        let unique = format!("db_sync_test_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+        let temp_dir = std::env::temp_dir().join(unique);
+        let bin_dir = temp_dir
+            .join("laragon")
+            .join("bin")
+            .join("mysql")
+            .join("mysql-8.0.30-winx64")
+            .join("bin");
+        fs::create_dir_all(&bin_dir).unwrap();
+        let dummy_exe = bin_dir.join("mysql");
+        fs::write(&dummy_exe, b"dummy").unwrap();
+
+        let found = find_mysql_binary_in_tree(
+            &temp_dir.join("laragon").join("bin").join("mysql"),
+            &["mysql".to_string()],
+            2,
+        );
+
+        assert_eq!(found, Some(dummy_exe));
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

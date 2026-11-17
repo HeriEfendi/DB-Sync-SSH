@@ -90,6 +90,14 @@ Jika bekerja di sisi *backend* atau logika sistem:
 
 ## 6. Cara Kerja & Respons Agent (Workflow)
 
+### Prinsip Perilaku Kerja
+
+1. **Think Before Acting:** Jangan menebak. Jika instruksi ambigu, ajukan pertanyaan klarifikasi singkat sebelum bertindak.
+2. **Chain of Draft (internal saja):** Batasi tiap langkah perencanaan internal maksimal 5 kata. Jangan tampilkan penalaran pribadi; bagikan kesimpulan ringkas saja.
+3. **Diff-Only & Simplicity:** Pilih solusi paling sederhana. Saat melaporkan edit, tampilkan hanya bagian yang berubah atau diff ringkas, bukan seluruh file kecuali diminta.
+4. **No Fluff:** Gunakan bahasa singkat dan langsung tanpa basa-basi; tetap sertakan hasil dan verifikasi yang diperlukan.
+5. **Fail Fast:** Jika aksi atau tool yang sama gagal dua kali, hentikan percobaan ulang dan laporkan kendalanya.
+
 Saat pengguna meminta fitur baru atau perbaikan:
 
 1. **Audit Komponen & Rencanakan Struktur:** Sebelum menulis kode, **cek terlebih dahulu daftar komponen dan fungsi yang sudah ada di proyek**. Sebutkan komponen mana saja yang akan dipakai ulang (beserta penambahan *props*-nya jika diperlukan) dan file baru apa saja yang benar-benar perlu dibuat.

@@ -231,7 +231,19 @@ pub async fn test_local_connection(config: &LocalDbConfig) -> Result<String, Str
         .map_err(|e| format!("Gagal mengambil versi MySQL: {}", e))?;
 
     pool.close().await;
-    Ok(row.0)
+
+    let cli_info = match crate::process_utils::resolve_mysql_binary(&["mariadb", "mysql"]) {
+        Ok(path) => {
+            let file_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("client");
+            format!(" [CLI: {}]", file_name)
+        }
+        Err(_) => " (Perhatian: CLI mariadb.exe/mysql.exe belum terdeteksi untuk import)".to_string(),
+    };
+
+    Ok(format!("{}{}", row.0, cli_info))
 }
 
 pub async fn ensure_local_database_exists(config: &LocalDbConfig) -> Result<(), String> {
